@@ -9,6 +9,7 @@ from .affine_quantized_tensor import (
     PlainLayoutType,
     SemiSparseLayoutType,
     TensorCoreTiledLayoutType,
+    MarlinSparseLayoutType,
 )
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     "PlainLayoutType",
     "SemiSparseLayoutType",
     "TensorCoreTiledLayoutType",
+    "MarlinSparseLayoutType",
 ]
