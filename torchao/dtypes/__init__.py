@@ -14,6 +14,7 @@ from .affine_quantized_tensor import (
     TensorCoreTiledLayoutType,
     Float8LayoutType,
     Float8AQTLayout,
+    MarlinSparseLayoutType,
 )
 
 __all__ = [
@@ -31,4 +32,5 @@ __all__ = [
     "TensorCoreTiledLayoutType",
     "Float8LayoutType",
     "Float8AQTLayout",
+    "MarlinSparseLayoutType",
 ]
