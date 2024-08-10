@@ -302,7 +302,7 @@ def test_dequantize_tensor_core_tiled_layout_op(shape, inner_k_tiles, group_size
         test_utils=test_utils,
     )
 
-###########################################################################################
+############################ WIP Diogo ################################
 
 DEV = torch.device("cuda:0")
 import torch.nn as nn
@@ -811,6 +811,10 @@ class Marlin24MM(TestCase):
                 for n, k in [(256, 512), (256, 1024), (256 * 128, 1024)]:
                     for thread_shape in [(128, 128), (64, 256)]:
                         self._run_problem(n, m, k, *thread_shape, groupsize)
+
+def test_marlin_24_mm():
+    # TODO(diogo): Add test for opcheck
+    pass
 
 ###########################################################################################
 

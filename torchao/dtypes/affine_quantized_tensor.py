@@ -30,6 +30,12 @@ from torchao.dtypes.utils import (
 from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 from dataclasses import dataclass
 from torchao.utils import TORCH_VERSION_AT_LEAST_2_5
+from torchao.sparsity.marlin import (
+    sparse_semi_structured_from_dense_cutlass,
+    sparse_semi_structured_to_dense_cutlass,
+    mask_creator,
+    _get_perms_2_4
+)
 
 aten = torch.ops.aten
 
@@ -369,6 +375,18 @@ class TensorCoreTiledLayoutType(LayoutType):
         return f"inner_k_tiles={self.inner_k_tiles}"
 
 
+@dataclass(frozen=True)
+class MarlinSparseLayoutType(LayoutType):
+    tiles = 16
+
+    def pre_process(self, input: torch.Tensor) -> torch.Tensor:
+        # prune to 2:4 if not already
+        temp = input.detach()
+        pruning_inds = temp.abs().view(-1, 4).argsort(dim=1)[:, :2]
+        temp.view(-1, 4).scatter_(1, pruning_inds, value=0)
+        return temp
+
+
 @register_layout_cls(PlainLayoutType)
 class PlainAQTLayout(AQTLayout):
     """
@@ -515,6 +533,165 @@ class SemiSparseAQTLayout(PlainAQTLayout):
         assert isinstance(layout_type, SemiSparseLayoutType)
         int_data_compressed = torch._cslt_compress(int_data)
         return cls(int_data_compressed, scale, zero_point, layout_type)
+
+
+@register_layout_cls(MarlinSparseLayoutType)
+class MarlinSparseAQTLayout(AQTLayout):
+    """
+    Layout storage class for sparse_marlin_24 layout for affine quantized tensor
+    """
+    def __new__(
+        cls,
+        int_data: torch.Tensor,
+        scale: torch.Tensor,
+        zero_point: torch.Tensor,
+        meta: torch.Tensor,
+        layout_type: LayoutType,
+    ):
+        kwargs = {}
+        kwargs["device"] = int_data.device
+        kwargs["layout"] = (
+            kwargs.get("layout") if kwargs.get("layout", False) else int_data.layout
+        )
+        kwargs["dtype"] = int_data.dtype
+        kwargs["requires_grad"] = False
+        shape = int_data.shape
+        return torch.Tensor._make_wrapper_subclass(cls, shape, **kwargs)  # type: ignore[attr-defined]
+
+    def __init__(
+        self,
+        int_data: torch.Tensor,
+        scale: torch.Tensor,
+        zero_point: torch.Tensor,
+        meta: torch.Tensor,
+        layout_type: LayoutType,
+    ):
+        self.int_data = int_data
+        self.scale = scale
+        self.zero_point = zero_point
+        self.meta = meta
+        self.layout_type = layout_type
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args, kwargs):
+        kwargs = {} if kwargs is None else kwargs
+
+        if func is aten.detach.default:
+            return return_and_correct_aliasing(
+                func, args, kwargs, args[0]._apply_fn_to_data(torch.detach)
+            )
+
+        raise NotImplementedError(
+            f"MarlinSparseAQTLayout dispatch: attempting to run {func}, this is not supported"
+        )
+
+    def get_plain(self):
+        int_data_expanded, scales_expanded = self._unpack(self.int_data, self.scale, self.meta, self.layout_type)
+        return int_data_expanded, scales_expanded, self.zero_point
+
+    @classmethod
+    def from_plain(
+        cls,
+        int_data: torch.Tensor,
+        scale: torch.Tensor,
+        zero_point: torch.Tensor,
+        layout_type: LayoutType,
+    ):
+        assert isinstance(layout_type, MarlinSparseLayoutType)
+
+        if int_data.dtype != torch.int32:
+            raise ValueError("Only `torch.int32` weights are supported.")
+        
+        in_features, out_features = int_data.shape
+        if in_features % 128 != 0 or out_features != 256 == 0:
+            raise ValueError(
+                "`in_features` must be divisible by 64 and `out_features` by 256."
+            )
+
+        int_data_compressed, scales, meta = MarlinSparseAQTLayout._pack(int_data, scale, layout_type)
+        return cls(int_data_compressed, scales, zero_point, meta, layout_type)
+
+    @staticmethod
+    def _pack(int_data: torch.Tensor, scales: torch.Tensor, layout: MarlinSparseLayoutType):
+        """Pack a fake-quantized linear layer into this actual Marlin representation.
+        @linear: fake-quantized `torch.nn.Linear` layer to convert (must be of type `torch.half`)
+        @scales: corresponding quantization scales of shape `(infeatures, groups)`
+        """
+        import numpy as np
+        
+        perm, scale_perm, _ = _get_perms_2_4()
+        tile = layout.tiles
+        s = scales
+        w = int_data
+
+        s = s.reshape((-1, len(scale_perm)))[:, scale_perm]
+
+        mask = mask_creator(w.T).cuda().bool()
+        w = mask * w.T
+        w, meta = sparse_semi_structured_from_dense_cutlass(w)
+
+        w = w.t()
+
+        in_features, out_features = int_data.shape  # TODO(diogo): modify this
+
+        in_features = in_features // 2
+
+        s = s.reshape((-1, out_features)).contiguous()
+        w = w.reshape((in_features // tile, tile, out_features // tile, tile))
+        w = w.permute((0, 2, 1, 3))
+        w = w.reshape((in_features // tile, out_features * tile))
+        res = w
+        res = res.reshape((-1, perm.numel()))[:, perm].reshape(res.shape)
+        q = np.zeros((res.shape[0], res.shape[1] // 8), dtype=np.uint32)
+        res = res.cpu().numpy().astype(np.uint32)
+        for i in range(8):
+            q |= res[:, i::8] << 4 * i
+
+        q = torch.from_numpy(q.astype(np.int32)).to(w.device)
+        q[:, :] = q.to(int_data.device)
+        s[:, :] = s.to(scales.device)
+        meta[:, :] = meta.to(meta.device)
+
+        return q, s, meta
+
+    @staticmethod
+    def _unpack(q: torch.Tensor, s: torch.Tensor, meta: torch.Tensor, layout: MarlinSparseLayoutType):
+        """
+        Unpack the compressed representation of a linear layer back into its dense form.
+
+        @q: Compressed weights tensor.
+        @s: Quantization scales of shape `(infeatures, groups)`.
+        @meta: Metadata required for unpacking the sparse matrix.
+        """
+
+        import numpy as np
+        
+        perm, scale_perm, _ = _get_perms_2_4()
+        tile = layout.tiles
+        
+        in_features = q.shape[0] * 2
+        out_features = s.shape[1]
+        
+        s = s.reshape((-1, len(scale_perm)))[:, np.argsort(scale_perm)]
+        s = s.reshape((-1, out_features)).contiguous()
+
+        res = np.zeros((q.shape[0], q.shape[1] * 8), dtype=np.uint32)
+        for i in range(8):
+            res[:, i::8] = (q.cpu().numpy() >> (4 * i)) & 0xF
+        
+        res = torch.from_numpy(res.astype(np.int32)).to(q.device)
+
+        res = res.reshape((-1, perm.numel()))[:, np.argsort(perm)].reshape(res.shape)
+        w = res.reshape((in_features // tile, out_features // tile, tile, tile))
+        w = w.permute((0, 2, 1, 3))
+        w = w.reshape((in_features, out_features)).t()
+
+        w_dense = sparse_semi_structured_to_dense_cutlass(w, meta)
+
+        mask = mask_creator(w_dense.T).cuda().bool()
+        w_dense = (w_dense.T / mask.float()).t()
+
+        return w_dense, s
 
 
 @register_layout_cls(TensorCoreTiledLayoutType)
