@@ -1,10 +1,8 @@
 import torch
 
 
-########
 # The code in this file has been adapted from the following source:
 # https://github.com/IST-DASLab/Sparse-Marlin/blob/main/marlin/_semi_structured_conversions.py
-########
 
 
 # This function converts dense matrix into sparse semi-structured

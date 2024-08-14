@@ -381,13 +381,6 @@ class TensorCoreTiledLayoutType(LayoutType):
 class MarlinSparseLayoutType(LayoutType):
     tiles = 16
 
-    def pre_process(self, input: torch.Tensor) -> torch.Tensor:
-        # prune to 2:4 if not already
-        temp = input.detach()
-        pruning_inds = temp.abs().view(-1, 4).argsort(dim=1)[:, :2]
-        temp.view(-1, 4).scatter_(1, pruning_inds, value=0)
-        return temp
-
 
 @register_layout_cls(PlainLayoutType)
 class PlainAQTLayout(AQTLayout):
@@ -549,6 +542,7 @@ class MarlinSparseAQTLayout(AQTLayout):
         zero_point: torch.Tensor,
         meta: torch.Tensor,
         layout_type: LayoutType,
+        initial_shape: torch.Size,
     ):
         kwargs = {}
         kwargs["device"] = int_data.device
@@ -567,12 +561,14 @@ class MarlinSparseAQTLayout(AQTLayout):
         zero_point: torch.Tensor,
         meta: torch.Tensor,
         layout_type: LayoutType,
+        initial_shape: torch.Size,
     ):
         self.int_data = int_data
         self.scale = scale
         self.zero_point = zero_point
         self.meta = meta
         self.layout_type = layout_type
+        self.initial_shape = initial_shape
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args, kwargs):
@@ -588,8 +584,14 @@ class MarlinSparseAQTLayout(AQTLayout):
         )
 
     def get_plain(self):
-        int_data_expanded, scales_expanded = self._unpack(self.int_data, self.scale, self.meta, self.layout_type)
+        int_data_expanded, scales_expanded = self._unpack(self.int_data, self.scale, self.meta, self.layout_type, self.initial_shape)
         return int_data_expanded, scales_expanded, self.zero_point
+
+    def _apply_fn_to_data(self, fn):
+        self.int_data = fn(self.int_data)
+        self.scale = fn(self.scale)
+        self.zero_point = fn(self.zero_point)
+        return self
 
     @classmethod
     def from_plain(
@@ -611,7 +613,7 @@ class MarlinSparseAQTLayout(AQTLayout):
             )
 
         int_data_compressed, scales, meta = MarlinSparseAQTLayout._pack(int_data, scale, layout_type)
-        return cls(int_data_compressed, scales, zero_point, meta, layout_type)
+        return cls(int_data_compressed, scales, zero_point, meta, layout_type, int_data.shape)
 
     @staticmethod
     def _pack(int_data: torch.Tensor, scales: torch.Tensor, layout: MarlinSparseLayoutType):
@@ -660,17 +662,6 @@ class MarlinSparseAQTLayout(AQTLayout):
         s[:, :] = s.to(scales.device)
         meta[:, :] = meta.to(meta.device)
 
-        ### START TESTING UNPACK ###
-        w_unpacked = torch.zeros_like(int_data)
-        s_unpacked = torch.zeros_like(scales)
-        
-        # Revert the packing on the scales
-        s_unpacked = MarlinSparseAQTLayout._reverse_scales(s)
-        assert torch.allclose(s_unpacked, scales), "SCALES Unpacking failed"
-
-        # Revert the packing on the weights
-        w_unpacked = MarlinSparseAQTLayout._reverse_weights(q, tile, meta, int_data.shape)
-        assert torch.allclose(w_unpacked, int_data), "WEIGHT Unpacking failed"
         return q, s, meta
     
     @staticmethod
@@ -702,9 +693,6 @@ class MarlinSparseAQTLayout(AQTLayout):
         w_unpacked = sparse_semi_structured_to_dense_cutlass(w, meta)
         w_unpacked = w_unpacked.t()
 
-        # Step 5: Restore the zero values
-        # WIP(diogo): Implement this step
-
         return w_unpacked
     
     @staticmethod
@@ -730,7 +718,7 @@ class MarlinSparseAQTLayout(AQTLayout):
         return s_unpacked
 
     @staticmethod
-    def _unpack(q: torch.Tensor, s: torch.Tensor, meta: torch.Tensor, layout: MarlinSparseLayoutType):
+    def _unpack(q: torch.Tensor, s: torch.Tensor, meta: torch.Tensor, layout: MarlinSparseLayoutType, initial_shape: torch.Size):
         """
         Unpack the compressed representation of a linear layer back into its dense form.
 
@@ -738,41 +726,13 @@ class MarlinSparseAQTLayout(AQTLayout):
         @s: Quantization scales of shape `(infeatures, groups)`.
         @meta: Metadata required for unpacking the sparse matrix.
         """
+        # Revert the packing on the scales
+        s_unpacked = MarlinSparseAQTLayout._reverse_scales(s)
 
-        import numpy as np
-        # avoid circular import
-        from torchao.sparsity.marlin import (
-            sparse_semi_structured_to_dense_cutlass,
-            mask_creator,
-            _get_perms_2_4
-        )
-        
-        perm, scale_perm, _ = _get_perms_2_4()
-        tile = layout.tiles
-        
-        in_features = q.shape[0] * 2
-        out_features = s.shape[1]
-        
-        s = s.reshape((-1, len(scale_perm)))[:, np.argsort(scale_perm)]
-        s = s.reshape((-1, out_features)).contiguous()
+        # Revert the packing on the weights
+        w_unpacked = MarlinSparseAQTLayout._reverse_weights(q, layout.tiles, meta, initial_shape)
 
-        res = np.zeros((q.shape[0], q.shape[1] * 8), dtype=np.uint32)
-        for i in range(8):
-            res[:, i::8] = (q.cpu().numpy() >> (4 * i)) & 0xF
-        
-        res = torch.from_numpy(res.astype(np.int32)).to(q.device)
-
-        res = res.reshape((-1, perm.numel()))[:, np.argsort(perm)].reshape(res.shape)
-        w = res.reshape((in_features // tile, out_features // tile, tile, tile))
-        w = w.permute((0, 2, 1, 3))
-        w = w.reshape((in_features, out_features)).t()
-
-        w_dense = sparse_semi_structured_to_dense_cutlass(w, meta)
-
-        mask = mask_creator(w_dense.T).cuda().bool()
-        w_dense = (w_dense.T / mask.float()).t()
-
-        return w_dense, s
+        return w_unpacked, s_unpacked
 
 
 @register_layout_cls(TensorCoreTiledLayoutType)
