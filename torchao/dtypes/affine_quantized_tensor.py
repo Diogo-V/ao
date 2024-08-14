@@ -626,7 +626,7 @@ class MarlinSparseAQTLayout(AQTLayout):
             mask_creator,
             _get_perms_2_4
         )
-        
+
         perm, scale_perm, _ = _get_perms_2_4()
         tile = layout.tiles
         s = scales
@@ -637,11 +637,9 @@ class MarlinSparseAQTLayout(AQTLayout):
         mask = mask_creator(w.T).cuda().bool()
         w = mask * w.T
         w, meta = sparse_semi_structured_from_dense_cutlass(w)
-
         w = w.t()
 
-        in_features, out_features = int_data.shape  # TODO(diogo): modify this
-
+        in_features, out_features = int_data.shape
         in_features = in_features // 2
 
         s = s.reshape((-1, out_features)).contiguous()
@@ -650,6 +648,8 @@ class MarlinSparseAQTLayout(AQTLayout):
         w = w.reshape((in_features // tile, out_features * tile))
         res = w
         res = res.reshape((-1, perm.numel()))[:, perm].reshape(res.shape)
+
+        # TODO(diogo): check if I can do this with torch?
         q = np.zeros((res.shape[0], res.shape[1] // 8), dtype=np.uint32)
         res = res.cpu().numpy().astype(np.uint32)
         for i in range(8):
@@ -660,7 +660,74 @@ class MarlinSparseAQTLayout(AQTLayout):
         s[:, :] = s.to(scales.device)
         meta[:, :] = meta.to(meta.device)
 
+        ### START TESTING UNPACK ###
+        w_unpacked = torch.zeros_like(int_data)
+        s_unpacked = torch.zeros_like(scales)
+        
+        # Revert the packing on the scales
+        s_unpacked = MarlinSparseAQTLayout._reverse_scales(s)
+        assert torch.allclose(s_unpacked, scales), "SCALES Unpacking failed"
+
+        # Revert the packing on the weights
+        w_unpacked = MarlinSparseAQTLayout._reverse_weights(q, tile, meta, int_data.shape)
+        assert torch.allclose(w_unpacked, int_data), "WEIGHT Unpacking failed"
         return q, s, meta
+    
+    @staticmethod
+    def _reverse_weights(q: torch.Tensor, tile: int, meta: torch.Tensor, initial_shape: Tuple[int, int]):
+        import numpy as np
+        from torchao.sparsity.marlin import (
+            _get_perms_2_4,
+            sparse_semi_structured_to_dense_cutlass
+        )
+        perm, _, _ = _get_perms_2_4()
+
+        res_ = np.zeros((q.shape[0], q.shape[1] * 8), dtype=np.uint32)
+        for i in range(8):
+            res_[:, i::8] = (q.cpu().numpy() >> (4 * i)) & 0xF
+        res_ = torch.from_numpy(res_.astype(np.int32)).to(q.device)
+
+        # Step 2: Reverse the permutation
+        res_ = res_.reshape((-1, perm.numel()))[:, torch.argsort(perm)].reshape(res_.shape)
+
+        # Step 3: Reverse the reshape and permutation applied before
+        in_features, out_features = initial_shape
+        in_features = in_features // 2
+
+        w = res_.reshape((in_features // tile, out_features // tile, tile, tile))
+        w = w.permute((0, 2, 1, 3))
+        w = w.reshape((in_features, out_features))
+        w = w.t()
+
+        w_unpacked = sparse_semi_structured_to_dense_cutlass(w, meta)
+        w_unpacked = w_unpacked.t()
+
+        # Step 5: Restore the zero values
+        # WIP(diogo): Implement this step
+
+        return w_unpacked
+    
+    @staticmethod
+    def _reverse_scales(scales: torch.Tensor):
+        from torchao.sparsity.marlin import (
+            _get_perms_2_4
+        )
+
+        _, scale_perm, _ = _get_perms_2_4()
+        
+        # Step 1: Reverse the final reshape
+        # Original reshaped scales were of shape (-1, out_features)
+        s_unpacked = scales.reshape((-1, len(scale_perm)))
+
+        # Step 2: Reverse the permutation
+        reverse_perm = torch.tensor(scale_perm).argsort()
+        s_unpacked = s_unpacked[:, reverse_perm]
+
+        # Step 3: Reverse the initial reshape
+        # Flatten the scales back to 1D
+        s_unpacked = s_unpacked.reshape(-1)
+
+        return s_unpacked
 
     @staticmethod
     def _unpack(q: torch.Tensor, s: torch.Tensor, meta: torch.Tensor, layout: MarlinSparseLayoutType):
