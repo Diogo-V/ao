@@ -5,7 +5,7 @@ import copy
 from torch import nn
 from torch.testing._internal.common_utils import TestCase
 from torchao.utils import TORCH_VERSION_AFTER_2_3
-from torchao.dtypes.affine_quantized_tensor import MarlinSparseLayoutType
+from torchao.dtypes import MarlinSparseLayoutType
 from torchao.sparsity.sparse_api import apply_fake_sparsity
 from torchao.quantization.quant_api import int4_weight_only, quantize_
 

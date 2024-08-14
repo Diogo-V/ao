@@ -36,6 +36,8 @@ from torchao.sparsity.marlin import (
     mask_creator,
     _get_perms_2_4
 )
+from torchao.utils import TORCH_VERSION_AFTER_2_5
+
 
 aten = torch.ops.aten
 
@@ -618,6 +620,12 @@ class MarlinSparseAQTLayout(AQTLayout):
         @scales: corresponding quantization scales of shape `(infeatures, groups)`
         """
         import numpy as np
+        # avoid circular import
+        from torchao.sparsity.marlin import (
+            sparse_semi_structured_from_dense_cutlass,
+            mask_creator,
+            _get_perms_2_4
+        )
         
         perm, scale_perm, _ = _get_perms_2_4()
         tile = layout.tiles
@@ -665,6 +673,12 @@ class MarlinSparseAQTLayout(AQTLayout):
         """
 
         import numpy as np
+        # avoid circular import
+        from torchao.sparsity.marlin import (
+            sparse_semi_structured_to_dense_cutlass,
+            mask_creator,
+            _get_perms_2_4
+        )
         
         perm, scale_perm, _ = _get_perms_2_4()
         tile = layout.tiles
