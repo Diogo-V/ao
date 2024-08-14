@@ -379,7 +379,7 @@ class TensorCoreTiledLayoutType(LayoutType):
 
 @dataclass(frozen=True)
 class MarlinSparseLayoutType(LayoutType):
-    tiles = 16
+    tile = 16
 
 
 @register_layout_cls(PlainLayoutType)
@@ -584,14 +584,9 @@ class MarlinSparseAQTLayout(AQTLayout):
         )
 
     def get_plain(self):
-        int_data_expanded, scales_expanded = self._unpack(self.int_data, self.scale, self.meta, self.layout_type, self.initial_shape)
+        from torchao.sparsity.marlin import unpack_from_sparse_marlin_24  # avoid circular import
+        int_data_expanded, scales_expanded = unpack_from_sparse_marlin_24(self.int_data, self.scale, self.meta, self.layout_type.tile, self.initial_shape)
         return int_data_expanded, scales_expanded, self.zero_point
-
-    def _apply_fn_to_data(self, fn):
-        self.int_data = fn(self.int_data)
-        self.scale = fn(self.scale)
-        self.zero_point = fn(self.zero_point)
-        return self
 
     @classmethod
     def from_plain(
@@ -601,6 +596,7 @@ class MarlinSparseAQTLayout(AQTLayout):
         zero_point: torch.Tensor,
         layout_type: LayoutType,
     ):
+        from torchao.sparsity.marlin import pack_to_sparse_marlin_24  # avoid circular import
         assert isinstance(layout_type, MarlinSparseLayoutType)
 
         if int_data.dtype != torch.int32:
@@ -612,128 +608,16 @@ class MarlinSparseAQTLayout(AQTLayout):
                 "`in_features` must be divisible by 64 and `out_features` by 256."
             )
 
-        int_data_compressed, scales, meta = MarlinSparseAQTLayout._pack(int_data, scale, layout_type)
+        int_data_compressed, scales, meta = pack_to_sparse_marlin_24(int_data, scale, layout_type.tile)
         return cls(int_data_compressed, scales, zero_point, meta, layout_type, int_data.shape)
 
-    @staticmethod
-    def _pack(int_data: torch.Tensor, scales: torch.Tensor, layout: MarlinSparseLayoutType):
-        """Pack a fake-quantized linear layer into this actual Marlin representation.
-        @linear: fake-quantized `torch.nn.Linear` layer to convert (must be of type `torch.half`)
-        @scales: corresponding quantization scales of shape `(infeatures, groups)`
-        """
-        import numpy as np
-        # avoid circular import
-        from torchao.sparsity.marlin import (
-            sparse_semi_structured_from_dense_cutlass,
-            mask_creator,
-            _get_perms_2_4
-        )
-
-        perm, scale_perm, _ = _get_perms_2_4()
-        tile = layout.tiles
-        s = scales
-        w = int_data
-
-        s = s.reshape((-1, len(scale_perm)))[:, scale_perm]
-
-        mask = mask_creator(w.T).cuda().bool()
-        w = mask * w.T
-        w, meta = sparse_semi_structured_from_dense_cutlass(w)
-        w = w.t()
-
-        in_features, out_features = int_data.shape
-        in_features = in_features // 2
-
-        s = s.reshape((-1, out_features)).contiguous()
-        w = w.reshape((in_features // tile, tile, out_features // tile, tile))
-        w = w.permute((0, 2, 1, 3))
-        w = w.reshape((in_features // tile, out_features * tile))
-        res = w
-        res = res.reshape((-1, perm.numel()))[:, perm].reshape(res.shape)
-
-        # TODO(diogo): check if I can do this with torch?
-        q = np.zeros((res.shape[0], res.shape[1] // 8), dtype=np.uint32)
-        res = res.cpu().numpy().astype(np.uint32)
-        for i in range(8):
-            q |= res[:, i::8] << 4 * i
-
-        q = torch.from_numpy(q.astype(np.int32)).to(w.device)
-        q[:, :] = q.to(int_data.device)
-        s[:, :] = s.to(scales.device)
-        meta[:, :] = meta.to(meta.device)
-
-        return q, s, meta
+    def _apply_fn_to_data(self, fn):
+        self.int_data = fn(self.int_data)
+        self.scale = fn(self.scale)
+        self.zero_point = fn(self.zero_point)
+        self.meta = fn(self.meta)
+        return self
     
-    @staticmethod
-    def _reverse_weights(q: torch.Tensor, tile: int, meta: torch.Tensor, initial_shape: Tuple[int, int]):
-        import numpy as np
-        from torchao.sparsity.marlin import (
-            _get_perms_2_4,
-            sparse_semi_structured_to_dense_cutlass
-        )
-        perm, _, _ = _get_perms_2_4()
-
-        res_ = np.zeros((q.shape[0], q.shape[1] * 8), dtype=np.uint32)
-        for i in range(8):
-            res_[:, i::8] = (q.cpu().numpy() >> (4 * i)) & 0xF
-        res_ = torch.from_numpy(res_.astype(np.int32)).to(q.device)
-
-        # Step 2: Reverse the permutation
-        res_ = res_.reshape((-1, perm.numel()))[:, torch.argsort(perm)].reshape(res_.shape)
-
-        # Step 3: Reverse the reshape and permutation applied before
-        in_features, out_features = initial_shape
-        in_features = in_features // 2
-
-        w = res_.reshape((in_features // tile, out_features // tile, tile, tile))
-        w = w.permute((0, 2, 1, 3))
-        w = w.reshape((in_features, out_features))
-        w = w.t()
-
-        w_unpacked = sparse_semi_structured_to_dense_cutlass(w, meta)
-        w_unpacked = w_unpacked.t()
-
-        return w_unpacked
-    
-    @staticmethod
-    def _reverse_scales(scales: torch.Tensor):
-        from torchao.sparsity.marlin import (
-            _get_perms_2_4
-        )
-
-        _, scale_perm, _ = _get_perms_2_4()
-        
-        # Step 1: Reverse the final reshape
-        # Original reshaped scales were of shape (-1, out_features)
-        s_unpacked = scales.reshape((-1, len(scale_perm)))
-
-        # Step 2: Reverse the permutation
-        reverse_perm = torch.tensor(scale_perm).argsort()
-        s_unpacked = s_unpacked[:, reverse_perm]
-
-        # Step 3: Reverse the initial reshape
-        # Flatten the scales back to 1D
-        s_unpacked = s_unpacked.reshape(-1)
-
-        return s_unpacked
-
-    @staticmethod
-    def _unpack(q: torch.Tensor, s: torch.Tensor, meta: torch.Tensor, layout: MarlinSparseLayoutType, initial_shape: torch.Size):
-        """
-        Unpack the compressed representation of a linear layer back into its dense form.
-
-        @q: Compressed weights tensor.
-        @s: Quantization scales of shape `(infeatures, groups)`.
-        @meta: Metadata required for unpacking the sparse matrix.
-        """
-        # Revert the packing on the scales
-        s_unpacked = MarlinSparseAQTLayout._reverse_scales(s)
-
-        # Revert the packing on the weights
-        w_unpacked = MarlinSparseAQTLayout._reverse_weights(q, layout.tiles, meta, initial_shape)
-
-        return w_unpacked, s_unpacked
-
 
 @register_layout_cls(TensorCoreTiledLayoutType)
 class TensorCoreTiledAQTLayout(AQTLayout):

@@ -1,14 +1,107 @@
 import torch
+from typing import Tuple
 
 
 # The code in this file has been adapted from the following source:
 # https://github.com/IST-DASLab/Sparse-Marlin/blob/main/marlin/_semi_structured_conversions.py
 
 
+def pack_to_sparse_marlin_24(
+        weight: torch.Tensor, 
+        scales: torch.Tensor, 
+        n_tiles: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pack a fake-quantized linear layer into this actual Marlin representation.
+    @linear: fake-quantized `torch.nn.Linear` layer to convert (must be of type `torch.half`)
+    @scales: corresponding quantization scales of shape `(infeatures, groups)`
+    """
+    import numpy as np
+
+    tile = n_tiles
+    s = scales
+    w = weight
+
+    s = s.reshape((-1, len(scale_perm)))[:, scale_perm]
+
+    mask = _mask_creator(w.T).cuda().bool()
+    w = mask * w.T
+    w, meta = _sparse_semi_structured_from_dense_cutlass(w)
+    w = w.t()
+
+    in_features, out_features = weight.shape
+    in_features = in_features // 2
+
+    s = s.reshape((-1, out_features)).contiguous()
+    w = w.reshape((in_features // tile, tile, out_features // tile, tile))
+    w = w.permute((0, 2, 1, 3))
+    w = w.reshape((in_features // tile, out_features * tile))
+    res = w
+    res = res.reshape((-1, perm.numel()))[:, perm].reshape(res.shape)
+
+    # TODO(diogo): check if I can do this with torch?
+    q = np.zeros((res.shape[0], res.shape[1] // 8), dtype=np.uint32)
+    res = res.cpu().numpy().astype(np.uint32)
+    for i in range(8):
+        q |= res[:, i::8] << 4 * i
+
+    q = torch.from_numpy(q.astype(np.int32)).to(w.device)
+    q[:, :] = q.to(weight.device)
+    s[:, :] = s.to(scales.device)
+    meta[:, :] = meta.to(meta.device)
+
+    return q, s, meta
+
+
+def unpack_from_sparse_marlin_24(q: torch.Tensor, s: torch.Tensor, meta: torch.Tensor, n_tiles: int, initial_shape: torch.Size) -> Tuple[torch.Tensor, torch.Tensor]:
+
+    def unpack_scales(scales: torch.Tensor):
+        
+        # Step 1: Reverse the final reshape
+        # Original reshaped scales were of shape (-1, out_features)
+        s_unpacked = scales.reshape((-1, len(scale_perm)))
+
+        # Step 2: Reverse the permutation
+        reverse_perm = torch.tensor(scale_perm).argsort()
+        s_unpacked = s_unpacked[:, reverse_perm]
+
+        # Step 3: Reverse the initial reshape
+        # Flatten the scales back to 1D
+        s_unpacked = s_unpacked.reshape(-1)
+
+        return s_unpacked
+
+    def unpack_weights(q: torch.Tensor, tile: int, meta: torch.Tensor, initial_shape: Tuple[int, int]):
+        import numpy as np
+
+        res_ = np.zeros((q.shape[0], q.shape[1] * 8), dtype=np.uint32)
+        for i in range(8):
+            res_[:, i::8] = (q.cpu().numpy() >> (4 * i)) & 0xF
+        res_ = torch.from_numpy(res_.astype(np.int32)).to(q.device)
+
+        # Step 2: Reverse the permutation
+        res_ = res_.reshape((-1, perm.numel()))[:, torch.argsort(perm)].reshape(res_.shape)
+
+        # Step 3: Reverse the reshape and permutation applied before
+        in_features, out_features = initial_shape
+        in_features = in_features // 2
+
+        w = res_.reshape((in_features // tile, out_features // tile, tile, tile))
+        w = w.permute((0, 2, 1, 3))
+        w = w.reshape((in_features, out_features))
+        w = w.t()
+
+        w_unpacked = _sparse_semi_structured_to_dense_cutlass(w, meta)
+        w_unpacked = w_unpacked.t()
+
+        return w_unpacked
+
+    return unpack_weights(q, n_tiles, meta, initial_shape), unpack_scales(s)
+
+
 # This function converts dense matrix into sparse semi-structured
 # representation, producing "compressed" matrix, in the layout used by
 # CUTLASS backend, and corresponding metadata matrix.
-def sparse_semi_structured_from_dense_cutlass(dense):
+def _sparse_semi_structured_from_dense_cutlass(dense):
     if dense.dim() != 2:
         raise RuntimeError(
             f"Expected 2-dimensional dense tensor, got {dense.dim()}-dimensional tensor"
@@ -140,7 +233,7 @@ def sparse_semi_structured_from_dense_cutlass(dense):
 # reconstructs dense matrix from a pair of "compressed" matrix, given
 # in the layout used by CUTLASS backend, and accompanying metadata
 # matrix.
-def sparse_semi_structured_to_dense_cutlass(sparse, meta_reordered):
+def _sparse_semi_structured_to_dense_cutlass(sparse, meta_reordered):
     if sparse.dim() != 2:
         raise RuntimeError(
             f"Expected 2-dimensional sparse tensor, got {sparse.dim()}-dimensional tensor"
@@ -283,7 +376,7 @@ def _calculate_meta_reordering_scatter_offsets(m, meta_ncols, meta_dtype, device
     return (cols_maj * m * interleave + dst_rows * interleave + cols_min).view(-1)
 
 
-def mask_creator(tensor):
+def _mask_creator(tensor):
     """
     Class for creating N:M sparsity masks.
     Masks will be created using the N:M ratio, where for every block of M weights,
@@ -342,3 +435,5 @@ def _get_perms_2_4():
     for i in range(8):
         scale_perm_single.extend([8 * i + j for j in [0, 1, 2, 3, 4, 5, 6, 7]])
     return perm, scale_perm, scale_perm_single
+
+perm, scale_perm, _ = _get_perms_2_4()
