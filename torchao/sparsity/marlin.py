@@ -16,7 +16,7 @@ def pack_to_sparse_marlin_24(
     @scales: corresponding quantization scales of shape `(infeatures, groups)`
     """
     import numpy as np
-
+    in_features, out_features = weight.shape
     tile = n_tiles
     s = scales
     w = weight
@@ -28,7 +28,6 @@ def pack_to_sparse_marlin_24(
     w, meta = _sparse_semi_structured_from_dense_cutlass(w)
     w = w.t()
 
-    in_features, out_features = weight.shape
     in_features = in_features // 2
 
     s = s.reshape((-1, out_features)).contiguous()
@@ -436,4 +435,5 @@ def _get_perms_2_4():
         scale_perm_single.extend([8 * i + j for j in [0, 1, 2, 3, 4, 5, 6, 7]])
     return perm, scale_perm, scale_perm_single
 
-perm, scale_perm, _ = _get_perms_2_4()
+# Precompute permutations for Marlin weight and scale shuffling
+perm, scale_perm, scale_perm_single = _get_perms_2_4()

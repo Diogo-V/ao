@@ -1,9 +1,9 @@
 import torch
-import unittest
 import copy
+import pytest
 
 from torch import nn
-from torch.testing._internal.common_utils import TestCase
+from torch.testing._internal.common_utils import TestCase, run_tests
 from torchao.utils import TORCH_VERSION_AFTER_2_3
 from torchao.dtypes import MarlinSparseLayoutType
 from torchao.sparsity.sparse_api import apply_fake_sparsity
@@ -12,8 +12,8 @@ from torchao.quantization.quant_api import int4_weight_only, quantize_
 
 class TestQuantSparseMarlin(TestCase):
 
-    @unittest.skipIf(not TORCH_VERSION_AFTER_2_3, "pytorch 2.3+ feature")
-    @unittest.skipIf(not torch.cuda.is_available(), "Need CUDA available")
+    @pytest.mark.skipif(not TORCH_VERSION_AFTER_2_3, reason="pytorch 2.3+ feature")
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Need CUDA available")
     def test_quant_sparse_marlin_layout(self):
         input = torch.rand((128, 128)).half().cuda()
         model = (
@@ -42,4 +42,4 @@ class TestQuantSparseMarlin(TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    run_tests()
