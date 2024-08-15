@@ -29,9 +29,10 @@ class TestQuantSparseMarlin(TestCase):
 
         apply_fake_sparsity(model)
         model_copy = copy.deepcopy(model)
+        model_copy = model_copy.bfloat16()
 
         quantize_(model_copy, int4_weight_only())
-        dense_result = model_copy(input)
+        dense_result = model_copy(input.bfloat16()).to(torch.float16)
 
         quantize_(model, int4_weight_only(layout_type=MarlinSparseLayoutType()))
         sparse_result = model(input)

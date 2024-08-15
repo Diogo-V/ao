@@ -17,10 +17,14 @@ def pack_to_sparse_marlin_24(
     """
     import numpy as np
     in_features, out_features = weight.shape
+    group_size = 128
     tile = n_tiles
     s = scales
     w = weight
 
+    w = w.reshape((group_size, -1, out_features))
+    w = w.permute(1, 0, 2)
+    w = w.reshape((in_features, out_features)).contiguous()
     s = s.reshape((-1, len(scale_perm)))[:, scale_perm]
 
     mask = _mask_creator(w.T).cuda().bool()
