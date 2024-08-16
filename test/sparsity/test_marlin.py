@@ -13,11 +13,11 @@ class TestQuantSparseMarlin(TestCase):
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="Need CUDA available")
     def test_quant_sparse_marlin_layout(self):
-        input = torch.rand((128, 128)).bfloat16().cuda()
+        input = torch.rand((128, 512)).bfloat16().cuda()
         model = (
             nn.Sequential(
-                nn.Linear(128, 256),
-                nn.Linear(256, 256),
+                nn.Linear(512, 4096),
+                nn.Linear(4096, 256),
                 nn.ReLU(),
                 nn.Linear(256, 128),
             )

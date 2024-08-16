@@ -9,7 +9,8 @@ from typing import Tuple
 def pack_to_sparse_marlin_24(
         weight: torch.Tensor, 
         scales: torch.Tensor, 
-        n_tiles: int
+        n_tiles: int,
+        group_size: int = 128,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Pack a fake-quantized linear layer into this actual Marlin representation.
     @linear: fake-quantized `torch.nn.Linear` layer to convert (must be of type `torch.half`)
@@ -17,15 +18,17 @@ def pack_to_sparse_marlin_24(
     """
     import numpy as np
     in_features, out_features = weight.shape
-    group_size = 128
     tile = n_tiles
     s = scales
     w = weight
 
-    w = w.reshape((group_size, -1, out_features))
-    w = w.permute(1, 0, 2)
-    w = w.reshape((in_features, out_features)).contiguous()
-    s = s.reshape((-1, len(scale_perm)))[:, scale_perm]
+    if group_size != in_features:
+        w = w.reshape((group_size, -1, out_features))
+        w = w.permute(1, 0, 2)
+        w = w.reshape((in_features, out_features)).contiguous()
+        s = s.reshape((-1, len(scale_perm)))[:, scale_perm]
+    else:
+        s = s.reshape((-1, len(scale_perm_single)))[:, scale_perm_single]
 
     mask = _mask_creator(w.T).cuda().bool()
     w = mask * w.T
@@ -55,7 +58,13 @@ def pack_to_sparse_marlin_24(
     return q, s, meta
 
 
-def unpack_from_sparse_marlin_24(q: torch.Tensor, s: torch.Tensor, meta: torch.Tensor, n_tiles: int, initial_shape: torch.Size) -> Tuple[torch.Tensor, torch.Tensor]:
+def unpack_from_sparse_marlin_24(
+        q: torch.Tensor, 
+        s: torch.Tensor, 
+        meta: torch.Tensor, 
+        n_tiles: int, 
+        initial_shape: torch.Size, 
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
 
     def unpack_scales(scales: torch.Tensor):
         

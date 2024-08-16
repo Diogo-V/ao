@@ -612,6 +612,9 @@ class MarlinSparseAQTLayout(AQTLayout):
         int_data_compressed, scales, meta = pack_to_sparse_marlin_24(int_data, scale, layout_type.tile)
         return cls(int_data_compressed, scales, zero_point, meta, layout_type, int_data.shape)
 
+    def get_layout_type(self) -> LayoutType:
+        return self.layout_type
+
     def _apply_fn_to_data(self, fn):
         self.int_data = fn(self.int_data)
         self.scale = fn(self.scale)
@@ -921,6 +924,7 @@ def _quantized_linear_op(input_tensor, weight_qtensor, bias):
             if bias is not None:
                 y += bias
             return y.to(orig_dtype)
+        # handle int4 weight only quant + sparse marlin 2:4
         elif (
             weight_is_uint4 and
             weight_qtensor.dtype == torch.float16 and
