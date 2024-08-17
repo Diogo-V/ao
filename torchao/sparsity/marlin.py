@@ -64,6 +64,7 @@ def unpack_from_sparse_marlin_24(
         meta: torch.Tensor, 
         n_tiles: int, 
         initial_shape: torch.Size, 
+        group_size: int = 128,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
     def unpack_scales(scales: torch.Tensor):
@@ -85,6 +86,7 @@ def unpack_from_sparse_marlin_24(
     def unpack_weights(q: torch.Tensor, tile: int, meta: torch.Tensor, initial_shape: Tuple[int, int]):
         import numpy as np
 
+        # Step 1: Reverse the packing
         res_ = np.zeros((q.shape[0], q.shape[1] * 8), dtype=np.uint32)
         for i in range(8):
             res_[:, i::8] = (q.cpu().numpy() >> (4 * i)) & 0xF
@@ -95,15 +97,20 @@ def unpack_from_sparse_marlin_24(
 
         # Step 3: Reverse the reshape and permutation applied before
         in_features, out_features = initial_shape
-        in_features = in_features // 2
+        in_features_sp = in_features // 2
 
-        w = res_.reshape((in_features // tile, out_features // tile, tile, tile))
+        w = res_.reshape((in_features_sp // tile, out_features // tile, tile, tile))
         w = w.permute((0, 2, 1, 3))
-        w = w.reshape((in_features, out_features))
+        w = w.reshape((in_features_sp, out_features))
         w = w.t()
 
         w_unpacked = _sparse_semi_structured_to_dense_cutlass(w, meta)
         w_unpacked = w_unpacked.t()
+
+        if group_size != in_features:
+            w_unpacked = w_unpacked.reshape(-1, group_size, out_features)
+            w_unpacked = w_unpacked.permute(1, 0, 2)
+            w_unpacked = w_unpacked.reshape(initial_shape).contiguous()
 
         return w_unpacked
 
