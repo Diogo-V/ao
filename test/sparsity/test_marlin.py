@@ -13,7 +13,7 @@ from torchao.sparsity.marlin import (
 )
 
 
-class TestSparseMarlin(TestCase):
+class SparseMarlin24(TestCase):
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="Need CUDA available")
     def test_quant_sparse_marlin_layout_e2e(self):
@@ -34,7 +34,7 @@ class TestSparseMarlin(TestCase):
 
         # Baseline to match against
         quantize_(model_copy.bfloat16(), int4_weight_only())
-        dense_result = model_copy(input)
+        dense_result = model_copy(input.bfloat16()).half()
 
         # Sparse + quantized
         quantize_(model, int4_weight_only(layout_type=MarlinSparseLayoutType()))

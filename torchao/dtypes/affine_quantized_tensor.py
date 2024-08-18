@@ -30,13 +30,6 @@ from torchao.dtypes.utils import (
 from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 from dataclasses import dataclass
 from torchao.utils import TORCH_VERSION_AT_LEAST_2_5
-from torchao.sparsity.marlin import (
-    sparse_semi_structured_from_dense_cutlass,
-    sparse_semi_structured_to_dense_cutlass,
-    mask_creator,
-    _get_perms_2_4
-)
-from torchao.utils import TORCH_VERSION_AFTER_2_5
 
 
 aten = torch.ops.aten
@@ -824,189 +817,6 @@ def _aqt_is_uint4(aqt):
         aqt.quant_max is None or aqt.quant_max == 15
     )
 
-def _quantized_linear_op(input_tensor, weight_qtensor, bias):
-    """
-    Quantized version of F.linear operator
-
-    Args:
-        input_tensor: dimension is (batch_size, in_features)
-        weight_tensor: dimension is (out_features, in_features)
-        bias: dimension is (out_features,)
-    """
-    is_cuda = weight_qtensor.is_cuda
-    is_cpu = weight_qtensor.device == torch.device("cpu")
-    if isinstance(weight_qtensor, AffineQuantizedTensor):
-        weight_is_int8 = _aqt_is_int8(weight_qtensor)
-        weight_is_uint4 = _aqt_is_uint4(weight_qtensor)
-
-        if isinstance(input_tensor, AffineQuantizedTensor):
-            # if input tensor is quantized, either dispatch to the int8 mm kernel
-            # or just dequantize the input tensor
-            input_is_int8 = _aqt_is_int8_reduced_range(input_tensor)
-            if (
-                is_cuda and
-                input_is_int8 and
-                input_tensor.dtype == weight_qtensor.dtype and
-                isinstance(input_tensor.layout_type, PlainLayoutType) and
-                isinstance(weight_qtensor.layout_type, PlainLayoutType)
-            ):
-                #
-                # 1. do the matrix form of dot(X_i, W_j)
-                #
-                #
-                # 2. rescale the output
-                #
-                # in cases with large matrices, y_dot_int32 can grow sufficiently
-                # large that y_dot_int32 * a float16 scale is greater than the maximum
-                # value of a float 16, (which results in a value of inf even if multiplying
-                # by the other scale would bring it within the expected range)
-
-                x_vals_int8 = input_tensor.layout_tensor.int_data
-                x_scales = input_tensor.layout_tensor.scale
-                w_vals_int8_t = weight_qtensor.layout_tensor.int_data.contiguous().t()
-                w_scales = weight_qtensor.layout_tensor.scale
-                tmp = x_vals_int8.reshape(-1, x_vals_int8.shape[-1])
-                y_dot_scaled = int_scaled_matmul(tmp, w_vals_int8_t, x_scales.reshape(-1, 1))
-
-                y = (y_dot_scaled * w_scales).reshape(
-                    *x_vals_int8.shape[:-1], y_dot_scaled.shape[-1]
-                )
-
-                # can downcast only at the very end
-                output_dtype = input_tensor.dtype
-                y = y.to(output_dtype)
-                if bias is not None:
-                    y += bias
-                return y
-            # handle int8 dynamic_quant + semi_structured_sparse
-            elif(
-                is_cuda and
-                input_is_int8 and
-                input_tensor.dtype == weight_qtensor.dtype and
-                isinstance(input_tensor.layout_type, PlainLayoutType) and
-                isinstance(weight_qtensor.layout_type, SemiSparseLayoutType)
-            ):
-                x_vals_int8 = input_tensor.layout_tensor.int_data
-                x_scales = input_tensor.layout_tensor.scale
-                w_vals_int8 = weight_qtensor.layout_tensor.int_data
-                w_scales = weight_qtensor.layout_tensor.scale
-                tmp = x_vals_int8.reshape(-1, x_vals_int8.shape[-1])
-                # we fuse one of the scalar matrix multiplications (w_scales) into the sparse mm
-                y_dot_bf16_w_scales_fused = torch._cslt_sparse_mm(
-                    w_vals_int8, tmp.t(), alpha=w_scales.to(torch.float32), out_dtype=torch.bfloat16
-                ).t()
-                y = (y_dot_bf16_w_scales_fused * x_scales.reshape(-1, 1)).reshape(
-                    *x_vals_int8.shape[:-1], y_dot_bf16_w_scales_fused.shape[-1]
-                )
-                output_dtype = input_tensor.dtype
-                y = y.to(output_dtype)
-                if bias is not None:
-                    y += bias
-                return y
-            else:
-                input_tensor = input_tensor.dequantize()
-
-        # weight only quantization
-        # TODO: enable cpu and mps path as well
-        # TODO: make sure weight dimension matches the expectation of the int4mm kernel
-        # TODO: cpu/cuda are sharing the same code now, may need some special handling for cpu
-        if (
-            weight_is_uint4 and
-            weight_qtensor.dtype == torch.bfloat16 and
-            len(weight_qtensor.shape) == 2 and
-            weight_qtensor.zero_point_domain == ZeroPointDomain.FLOAT and
-            isinstance(weight_qtensor.layout_type, TensorCoreTiledLayoutType)
-        ):
-            assert weight_qtensor.block_size[0] == 1, f"Requires groupwise quantization, got block_size: {block_size}"
-            assert input_tensor.shape[-1] == weight_qtensor.shape[1], (
-                f"need input_tensor shape: {input_tensor.shape} final"
-                f"dim to match weight_tensor shape: {weight_qtensor.shape} second dim "
-            )
-
-            # TODO: check groupsize quantization
-            # avoid circular dep, TODO: move this to a common util.py
-            act_mat = input_tensor
-            # weight is packed from padded (out_features, in_features) weight tensor
-            # (same dimension requirement as F.linear weight)
-            packed_weight = weight_qtensor.layout_tensor.packed_weight
-            scale_and_zero = weight_qtensor.layout_tensor.scale_and_zero
-
-            orig_act_size = act_mat.size()
-            orig_dtype = act_mat.dtype
-
-            # reshape and pad activation
-            act_mat = act_mat.reshape(-1, act_mat.shape[-1]).to(torch.bfloat16)
-            pad_size = find_multiple(act_mat.shape[-1], 1024)
-            act_mat = torch.nn.functional.pad(act_mat, (0, pad_size - act_mat.shape[-1]))
-
-            # groupwise int4 quantization
-            groupsize = weight_qtensor.block_size[1]
-            y = torch.ops.aten._weight_int4pack_mm(act_mat.contiguous(), packed_weight, groupsize, scale_and_zero)
-
-            # remove out_feature padding
-            orig_out_features = weight_qtensor.shape[-2]
-            y = y[:, :orig_out_features]
-            y = y.reshape(*orig_act_size[:-1], orig_out_features)
-
-            if bias is not None:
-                y += bias
-            return y.to(orig_dtype)
-        # handle int4 weight only quant + sparse marlin 2:4
-        elif (
-            weight_is_uint4 and
-            weight_qtensor.dtype == torch.float16 and
-            len(weight_qtensor.shape) == 2 and
-            weight_qtensor.zero_point_domain == ZeroPointDomain.FLOAT and
-            isinstance(weight_qtensor.layout_type, MarlinSparseLayoutType)
-        ):
-            from torchao.sparsity.marlin import marlin_24_mm  # avoid circular import
-
-            sparse_w_int4 = weight_qtensor.layout_tensor.int_data
-            scale = weight_qtensor.layout_tensor.scale
-            meta = weight_qtensor.layout_tensor.meta
-            original_shape = weight_qtensor.layout_tensor.original_shape
-            workspace = torch.zeros(original_shape[-1] // 128 * 16, device=sparse_w_int4.device, dtype=torch.int32)
-
-            out = marlin_24_mm(
-                input_tensor,
-                sparse_w_int4,
-                meta,
-                scale,
-                workspace
-            )
-
-            if bias is not None:
-                out += bias.to(out.dtype)
-            return out
-        elif (
-            weight_is_int8 and
-            len(weight_qtensor.shape) == 2 and
-            len(weight_qtensor.block_size) == 2 and
-            weight_qtensor.block_size[0] == 1 and
-            weight_qtensor.block_size[1] == weight_qtensor.shape[1] and
-            weight_qtensor.zero_point_domain == ZeroPointDomain.INT and
-            isinstance(weight_qtensor.layout_type, PlainLayoutType)
-        ):
-            # TODO: enable cpu and mps efficient path
-            # per channel int8 weight only quantizated mm
-            w_vals_int8_t = weight_qtensor.layout_tensor.int_data.t()
-            scale = weight_qtensor.layout_tensor.scale
-            orig_dtype = input_tensor.dtype
-            m = torch.mm(
-                    input_tensor.reshape(-1, input_tensor.shape[-1]),
-                    w_vals_int8_t.to(input_tensor.dtype),
-                )
-            y = m * scale.to(m.dtype)
-            y = y.reshape(*input_tensor.shape[:-1], y.shape[-1])
-            if bias is not None:
-                y += bias.to(m.dtype)
-            return y
-
-            # is_cpu and is_mps only, some issue with is_contiguous() currently
-            # return torch.ops.aten._weight_int8pack_mm(input_tensor.contiguous(), w_vals_int8_t, weight_qtensor.layout_tensor.scale)
-
-    raise NotImplementedError("No specialized dispatch found for quantized linear op")
-
 
 implements = AffineQuantizedTensor.implements
 
@@ -1192,6 +1002,38 @@ def _linear_fp_act_int8_weight_impl(input_tensor, weight_tensor, bias):
     return y
 
 
+def _linear_fp_act_int4_weight_sparse_marlin_check(input_tensor, weight_tensor, bias):
+    return (
+        _aqt_is_uint4(weight_tensor) and
+        input_tensor.dtype == torch.float16 and
+        len(weight_tensor.shape) == 2 and
+        weight_tensor.zero_point_domain == ZeroPointDomain.FLOAT and
+        isinstance(weight_tensor.layout_type, MarlinSparseLayoutType)
+    )
+
+
+def _linear_fp_act_int4_weight_sparse_marlin_impl(input_tensor, weight_tensor, bias):
+    from torchao.sparsity.marlin import marlin_24_mm  # avoid circular import
+
+    sparse_w_int4 = weight_tensor.layout_tensor.int_data
+    scale = weight_tensor.layout_tensor.scale
+    meta = weight_tensor.layout_tensor.meta
+    original_shape = weight_tensor.layout_tensor.original_shape
+    workspace = torch.zeros(original_shape[-1] // 128 * 16, device=sparse_w_int4.device, dtype=torch.int32)
+
+    out = marlin_24_mm(
+        input_tensor,
+        sparse_w_int4,
+        meta,
+        scale,
+        workspace
+    )
+
+    if bias is not None:
+        out += bias.to(out.dtype)
+    return out
+
+
 def _register_quantized_linear_dispatches():
     for dispatch_condition, impl in [
         (_linear_int8_act_int8_weight_check, _linear_int8_act_int8_weight_impl),
@@ -1199,6 +1041,7 @@ def _register_quantized_linear_dispatches():
         (_linear_quantized_act_fallback_check, _linear_quantized_act_fallback_impl),
         (_linear_bf16_act_uint4_weight_check, _linear_bf16_act_uint4_weight_impl),
         (_linear_fp_act_int8_weight_check, _linear_fp_act_int8_weight_impl),
+        (_linear_fp_act_int4_weight_sparse_marlin_check, _linear_fp_act_int4_weight_sparse_marlin_impl),
     ]:
         _register_quantized_linear_dispatch(dispatch_condition, impl)
 
