@@ -15,7 +15,6 @@ from torchao.quantization.quant_primitives import (
 from torchao.quantization.utils import (
     pack_tinygemm_scales_and_zeros,
 )
-from torchao.ops import marlin_24_mm
 from torch.utils._python_dispatch import return_and_correct_aliasing
 from torchao.utils import find_multiple
 from torchao.dtypes.utils import (
@@ -543,7 +542,7 @@ class MarlinSparseAQTLayout(AQTLayout):
         zero_point: torch.Tensor,
         meta: torch.Tensor,
         layout_type: LayoutType,
-        initial_shape: torch.Size,
+        original_shape: torch.Size,
     ):
         kwargs = {}
         kwargs["device"] = int_data.device
@@ -562,14 +561,14 @@ class MarlinSparseAQTLayout(AQTLayout):
         zero_point: torch.Tensor,
         meta: torch.Tensor,
         layout_type: LayoutType,
-        initial_shape: torch.Size,
+        original_shape: torch.Size,
     ):
         self.int_data = int_data
         self.scale = scale
         self.zero_point = zero_point
         self.meta = meta
         self.layout_type = layout_type
-        self.initial_shape = initial_shape
+        self.original_shape = original_shape
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args, kwargs):
@@ -585,8 +584,16 @@ class MarlinSparseAQTLayout(AQTLayout):
         )
 
     def get_plain(self):
-        from torchao.sparsity.marlin import unpack_from_sparse_marlin_24  # avoid circular import
-        int_data_expanded, scales_expanded = unpack_from_sparse_marlin_24(self.int_data, self.scale, self.meta, self.layout_type.tile, self.initial_shape)
+        # int_data_expanded, scales_expanded = unpack_from_sparse_marlin_24(
+        #     self.int_data, 
+        #     self.scale, 
+        #     self.meta, 
+        #     self.layout_type.tile, 
+        #     self.initial_shape
+        # )
+        # TODO(diogo): Figure out how to get the correct expanded data and what should be the expanded data
+        int_data_expanded = torch.randint(0, 15, self.original_shape, device=self.int_data.device).to(torch.int32)
+        scales_expanded = torch.randn(self.original_shape[1], device=self.int_data.device)
         return int_data_expanded, scales_expanded, self.zero_point
 
     @classmethod
@@ -597,7 +604,11 @@ class MarlinSparseAQTLayout(AQTLayout):
         zero_point: torch.Tensor,
         layout_type: LayoutType,
     ):
-        from torchao.sparsity.marlin import pack_to_sparse_marlin_24  # avoid circular import
+        from torchao.sparsity.marlin import (   # avoid circular import
+            pack_to_sparse_marlin_24, 
+            fake_quantize_marlin_format,
+            fp16_to_int4_marlin_format
+        )
         assert isinstance(layout_type, MarlinSparseLayoutType)
 
         if int_data.dtype != torch.int32:
@@ -609,9 +620,25 @@ class MarlinSparseAQTLayout(AQTLayout):
                 "`in_features` must be divisible by 64 and `out_features` by 256."
             )
 
-        int_data_compressed, scales, meta = pack_to_sparse_marlin_24(int_data, scale, layout_type.tile)
-        return cls(int_data_compressed, scales, zero_point, meta, layout_type, int_data.shape)
+        group_size = 128  # TODO(diogo): Put this in layout?
 
+        ##### TODO(diogo): Working on getting this to work directly with the int4 that is given
+        w_float = dequantize_affine(int_data, (1, group_size), scale, zero_point, int_data.dtype, 0, 15, ZeroPointDomain.FLOAT, output_dtype=torch.bfloat16)
+        w_float = w_float.detach()
+        ######
+
+        w_float, scales = fake_quantize_marlin_format(w_float, group_size=group_size)
+
+        # If no group_size is provided, we assume it is the same as the in_features of the weights
+        # https://github.com/IST-DASLab/Sparse-Marlin/blob/c2ffa2395a3ada26c8cb7f910a5ec65bd3ce288a/marlin/__init__.py#L290
+        if group_size == -1:
+            group_size = int_data.shape[0]
+
+        w_int4, scales = fp16_to_int4_marlin_format(w_float, scales, group_size=group_size)
+        int_data_compressed, scales, meta = pack_to_sparse_marlin_24(w_int4, scales, layout_type.tile)
+
+        return cls(int_data_compressed, scales, zero_point, meta, layout_type, int_data.shape)
+    
     def get_layout_type(self) -> LayoutType:
         return self.layout_type
 
@@ -932,18 +959,24 @@ def _quantized_linear_op(input_tensor, weight_qtensor, bias):
             weight_qtensor.zero_point_domain == ZeroPointDomain.FLOAT and
             isinstance(weight_qtensor.layout_type, MarlinSparseLayoutType)
         ):
-            w_sparse_int4 = weight_qtensor.layout_tensor.int_data
+            from torchao.sparsity.marlin import marlin_24_mm  # avoid circular import
+
+            sparse_w_int4 = weight_qtensor.layout_tensor.int_data
             scale = weight_qtensor.layout_tensor.scale
             meta = weight_qtensor.layout_tensor.meta
-            workspace = torch.zeros(w_sparse_int4.shape[0] // 128 * 16, device=w_sparse_int4.device, dtype=torch.int32)
+            original_shape = weight_qtensor.layout_tensor.original_shape
+            workspace = torch.zeros(original_shape[-1] // 128 * 16, device=sparse_w_int4.device, dtype=torch.int32)
 
             out = marlin_24_mm(
-                input_tensor.reshape(-1, input_tensor.shape[-1]),
-                w_sparse_int4,
+                input_tensor,
+                sparse_w_int4,
                 meta,
                 scale,
                 workspace
             )
+
+            if bias is not None:
+                out += bias.to(out.dtype)
             return out
         elif (
             weight_is_int8 and

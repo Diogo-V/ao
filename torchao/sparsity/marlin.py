@@ -1,36 +1,82 @@
 import torch
+import torchao.ops
+import numpy as np
 from typing import Tuple
+
+from torchao.sparsity.utils import mask_creator, get_perms_2_4
 
 
 # The code in this file has been adapted from the following source:
 # https://github.com/IST-DASLab/Sparse-Marlin/blob/main/marlin/_semi_structured_conversions.py
 
 
+# Pre-compute permutations for Marlin weight and scale shuffling
+perm, scale_perm, scale_perm_single = get_perms_2_4()
+
+
+def marlin_24_mm(
+    x: torch.Tensor,
+    weight_marlin: torch.Tensor,
+    meta: torch.Tensor,
+    s: torch.Tensor,
+    workspace: torch.Tensor,
+    thread_k: int = -1, 
+    thread_m: int = -1, 
+    sms: int = -1, 
+    max_par: int = 16,
+) -> torch.Tensor:
+    """
+    Sparse Marlin 2:4 matrix multiplication. Reference: https://github.com/IST-DASLab/Sparse-Marlin/tree/main
+
+    Args:
+        x: input matrix of shape `(n, k/2)` in column-major layout.
+        weight_marlin: weight matrix of original shape `(m, k)` in Marlin format; see `Layer.pack()`.
+        meta: metadata information for 2:4 sparsity.
+        s: scales of shape `(n / groupsize / 2, m)`.
+        workspace: tensor with at least `m / 128 * max_par` entries that are all zero.
+        thread_k:  size of a thread_tile in `A` (can usually be left as auto -1).
+        thread_m: size of a thread_tile in `A` (can usually be left as auto -1).
+        sms: number of SMs to use for the kernel (can usually be left as auto -1).
+        max_par: maximum number of batch 64 problems to solve in parallel for large input sizes.
+
+    Returns:
+        output matrix of shape `(n, m)` in column-major layout.
+    """
+    out = torch.empty((x.size(0), s.size(1)), dtype=x.dtype, device=x.device)
+
+    # From: https://github.com/IST-DASLab/Sparse-Marlin/blob/c2ffa2395a3ada26c8cb7f910a5ec65bd3ce288a/marlin/marlin_cuda.cpp#L66
+    prob_n = x.size(0)
+    prob_m = out.size(1)
+    prob_k = x.size(1)
+    group_size = -1 if s.size(0) == 1 else int(prob_k / 2 / s.size(0))
+    device = torch.cuda.current_device()
+
+    err = torchao.ops.marlin_24_mm(
+        x, weight_marlin, meta, out, 
+        s, prob_m, prob_n, prob_k, 
+        workspace, group_size, device,
+        thread_k, thread_m, sms, max_par
+    )
+    assert err == 0, "Error in Marlin 2:4 MM kernel"
+
+    return out
+
+
 def pack_to_sparse_marlin_24(
         weight: torch.Tensor, 
         scales: torch.Tensor, 
         n_tiles: int,
-        group_size: int = 128,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Pack a fake-quantized linear layer into this actual Marlin representation.
     @linear: fake-quantized `torch.nn.Linear` layer to convert (must be of type `torch.half`)
     @scales: corresponding quantization scales of shape `(infeatures, groups)`
     """
-    import numpy as np
     in_features, out_features = weight.shape
     tile = n_tiles
     s = scales
     w = weight
 
-    if group_size != in_features:
-        w = w.reshape((group_size, -1, out_features))
-        w = w.permute(1, 0, 2)
-        w = w.reshape((in_features, out_features)).contiguous()
-        s = s.reshape((-1, len(scale_perm)))[:, scale_perm]
-    else:
-        s = s.reshape((-1, len(scale_perm_single)))[:, scale_perm_single]
-
-    mask = _mask_creator(w.T).cuda().bool()
+    mask = mask_creator(w.T).cuda().bool()
     w = mask * w.T
     w, meta = _sparse_semi_structured_from_dense_cutlass(w)
     w = w.t()
@@ -44,7 +90,9 @@ def pack_to_sparse_marlin_24(
     res = w
     res = res.reshape((-1, perm.numel()))[:, perm].reshape(res.shape)
 
-    # TODO(diogo): check if I can do this with torch?
+    # NOTE: This is not yet supported in torch==2.4.0
+    # If we try to perform this operation in pytorch, the following error will be raised:
+    # `RuntimeError: Promotion for uint16, uint32, uint64 types is not supported, attempted to promote UInt32 and Int`
     q = np.zeros((res.shape[0], res.shape[1] // 8), dtype=np.uint32)
     res = res.cpu().numpy().astype(np.uint32)
     for i in range(8):
@@ -58,44 +106,81 @@ def pack_to_sparse_marlin_24(
     return q, s, meta
 
 
+def fp16_to_int4_marlin_format(weight: torch.Tensor, scales: torch.Tensor, group_size: int = -1) -> Tuple[torch.Tensor, torch.Tensor]:
+    maxq = 2**4 - 1
+    in_features, out_features = weight.shape
+    s = scales
+    w = weight
+
+    if group_size != in_features:
+        w = w.reshape((-1, group_size, out_features))
+        w = w.permute(1, 0, 2)
+        w = w.reshape((group_size, -1))
+        s = s.reshape((1, -1))
+
+    w = torch.round(w / s).int()
+    w += (maxq + 1) // 2
+    w = torch.clamp(w, 0, maxq)
+
+    if group_size != in_features:
+        w = w.reshape((group_size, -1, out_features))
+        w = w.permute(1, 0, 2)
+        w = w.reshape((in_features, out_features)).contiguous()
+        s = s.reshape((-1, len(scale_perm)))[:, scale_perm]
+    else:
+        s = s.reshape((-1, len(scale_perm_single)))[:, scale_perm_single]
+
+    return w, s
+
+
+def fake_quantize_marlin_format(weight: torch.Tensor, group_size: int = -1) -> Tuple[torch.Tensor, torch.Tensor]:
+    maxq = 2**4 - 1
+    m, k = weight.shape
+    w = weight.to(torch.half)
+
+    w = w.t()
+    if group_size != -1:
+        w = w.reshape((-1, group_size, m))
+        w = w.permute(1, 0, 2)
+        w = w.reshape((group_size, -1))
+
+    s = torch.max(torch.abs(w), 0, keepdim=True)[0]
+    s *= 2 / maxq
+    w = torch.round(w / s).int()
+    w += (maxq + 1) // 2
+    w = torch.clamp(w, 0, maxq)
+    ref = (w - (maxq + 1) // 2).half() * s
+
+    if group_size != -1:
+        ref = ref.reshape((group_size, -1, m))
+        ref = ref.permute(1, 0, 2)
+        ref = ref.reshape((k, m)).contiguous()
+    s = s.reshape((-1, m)).contiguous()
+
+    return ref, s
+
+
 def unpack_from_sparse_marlin_24(
         q: torch.Tensor, 
         s: torch.Tensor, 
         meta: torch.Tensor, 
         n_tiles: int, 
         initial_shape: torch.Size, 
-        group_size: int = 128,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
     def unpack_scales(scales: torch.Tensor):
-        
-        # Step 1: Reverse the final reshape
-        # Original reshaped scales were of shape (-1, out_features)
-        s_unpacked = scales.reshape((-1, len(scale_perm)))
-
-        # Step 2: Reverse the permutation
-        reverse_perm = torch.tensor(scale_perm).argsort()
-        s_unpacked = s_unpacked[:, reverse_perm]
-
-        # Step 3: Reverse the initial reshape
-        # Flatten the scales back to 1D
-        s_unpacked = s_unpacked.reshape(-1)
-
-        return s_unpacked
+        return scales.reshape(-1)
 
     def unpack_weights(q: torch.Tensor, tile: int, meta: torch.Tensor, initial_shape: Tuple[int, int]):
-        import numpy as np
-
-        # Step 1: Reverse the packing
+        # NOTE: This is not yet supported in torch==2.4.0
+        # If we try to perform this operation in pytorch, the following error will be raised:
+        # `RuntimeError: Promotion for uint16, uint32, uint64 types is not supported, attempted to promote UInt32 and Int`
         res_ = np.zeros((q.shape[0], q.shape[1] * 8), dtype=np.uint32)
         for i in range(8):
             res_[:, i::8] = (q.cpu().numpy() >> (4 * i)) & 0xF
         res_ = torch.from_numpy(res_.astype(np.int32)).to(q.device)
 
-        # Step 2: Reverse the permutation
         res_ = res_.reshape((-1, perm.numel()))[:, torch.argsort(perm)].reshape(res_.shape)
-
-        # Step 3: Reverse the reshape and permutation applied before
         in_features, out_features = initial_shape
         in_features_sp = in_features // 2
 
@@ -106,11 +191,6 @@ def unpack_from_sparse_marlin_24(
 
         w_unpacked = _sparse_semi_structured_to_dense_cutlass(w, meta)
         w_unpacked = w_unpacked.t()
-
-        if group_size != in_features:
-            w_unpacked = w_unpacked.reshape(-1, group_size, out_features)
-            w_unpacked = w_unpacked.permute(1, 0, 2)
-            w_unpacked = w_unpacked.reshape(initial_shape).contiguous()
 
         return w_unpacked
 
@@ -393,67 +473,3 @@ def _calculate_meta_reordering_scatter_offsets(m, meta_ncols, meta_dtype, device
     cols_maj = dst_cols // interleave
     cols_min = dst_cols % interleave
     return (cols_maj * m * interleave + dst_rows * interleave + cols_min).view(-1)
-
-
-def _mask_creator(tensor):
-    """
-    Class for creating N:M sparsity masks.
-    Masks will be created using the N:M ratio, where for every block of M weights,
-    N will be pruned based on ranked weight value. Each mask will correspond to the given tensor.
-
-    :param N: The number of weights in a group to keep
-    :param M: The size of a weight group
-    """
-    N = 2
-    M = 4
-
-    mask = None
-    # for i, tensor in enumerate(tensors):
-    if tensor.numel() % M != 0:
-        raise ValueError(
-            f"Tensor of size {tensor.shape} can't be evenly divided into " f"{M} groups"
-        )
-
-    num_groups = tensor.numel() // M
-
-    # N:M sparsity for linear layers
-    tensor_temp = tensor.detach().abs().reshape(num_groups, M)
-    index = torch.argsort(tensor_temp, dim=1)[:, : int(M - N)]
-
-    w_b = torch.ones(tensor_temp.shape, device=tensor_temp.device)
-    mask = w_b.scatter_(dim=1, index=index, value=0).reshape(tensor.shape)
-
-    return mask
-
-
-def _get_perms_2_4():
-    import numpy as np
-    perm = []
-    for i in range(32):
-        perm1 = []
-        col = i // 4
-        col_o = col // 2
-        for block in [0, 1]:
-            for row in [
-                2 * (i % 4),
-                2 * (i % 4) + 1,
-                2 * (i % 4 + 4),
-                2 * (i % 4 + 4) + 1,
-            ]:
-                perm1.append(16 * row + col_o * 256 + 8 * (col % 2) + 4 * block)
-        for j in range(4):
-            perm.extend([p + 1 * j for p in perm1])
-    perm = np.array(perm)
-    interleave = np.array([0, 2, 4, 6, 1, 3, 5, 7])
-    perm = perm.reshape((-1, 8))[:, interleave].ravel()
-    perm = torch.from_numpy(perm)
-    scale_perm = []
-    for i in range(8):
-        scale_perm.extend([i * 8 + j for j in [0, 4, 1, 5, 2, 6, 3, 7]])
-    scale_perm_single = []
-    for i in range(8):
-        scale_perm_single.extend([8 * i + j for j in [0, 1, 2, 3, 4, 5, 6, 7]])
-    return perm, scale_perm, scale_perm_single
-
-# Precompute permutations for Marlin weight and scale shuffling
-perm, scale_perm, scale_perm_single = _get_perms_2_4()

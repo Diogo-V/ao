@@ -22,6 +22,12 @@ try:
 except RuntimeError:
     pytest.skip("torchao.ops not available")
 
+from torchao.sparsity.utils import mask_creator
+from torchao.sparsity.marlin import (
+    pack_to_sparse_marlin_24,
+    marlin_24_mm,
+    fp16_to_int4_marlin_format
+)
 from torchao.quantization.utils import (
     get_groupwise_affine_qparams,
     groupwise_affine_dequantize_tensor_from_qparams,
@@ -302,463 +308,88 @@ def test_dequantize_tensor_core_tiled_layout_op(shape, inner_k_tiles, group_size
         test_utils=test_utils,
     )
 
-############################ WIP Diogo ################################
 
-DEV = torch.device("cuda:0")
-import torch.nn as nn
-import torch
-import numpy as np
+class SparseMarlin24(TestCase):
+    TILES = 16
 
+    def _op_check(self, inputs, sparse_w_int4, meta, scales, workspace, thread_k, thread_m, sms=-1, max_par=16):
+        out = torch.empty((inputs.size(0), scales.size(1)), dtype=inputs.dtype, device=inputs.device)
 
-def _get_perms_2_4():
-    perm = []
-    for i in range(32):
-        perm1 = []
-        col = i // 4
-        col_o = col // 2
-        for block in [0, 1]:
-            for row in [
-                2 * (i % 4),
-                2 * (i % 4) + 1,
-                2 * (i % 4 + 4),
-                2 * (i % 4 + 4) + 1,
-            ]:
-                perm1.append(16 * row + col_o * 256 + 8 * (col % 2) + 4 * block)
-        for j in range(4):
-            perm.extend([p + 1 * j for p in perm1])
-    perm = np.array(perm)
-    interleave = np.array([0, 2, 4, 6, 1, 3, 5, 7])
-    perm = perm.reshape((-1, 8))[:, interleave].ravel()
-    perm = torch.from_numpy(perm)
-    scale_perm = []
-    for i in range(8):
-        scale_perm.extend([i * 8 + j for j in [0, 4, 1, 5, 2, 6, 3, 7]])
-    scale_perm_single = []
-    for i in range(8):
-        scale_perm_single.extend([8 * i + j for j in [0, 1, 2, 3, 4, 5, 6, 7]])
-    return perm, scale_perm, scale_perm_single
+        prob_n = inputs.size(0)
+        prob_m = out.size(1)
+        prob_k = inputs.size(1)
+        group_size = -1 if scales.size(0) == 1 else int(prob_k / 2 / scales.size(0))
+        device = torch.cuda.current_device()
 
-
-# Precompute permutations for Marlin weight and scale shuffling
-def _get_perms():
-    perm = []
-    for i in range(32):
-        perm1 = []
-        col = i // 4
-        for block in [0, 1]:
-            for row in [
-                2 * (i % 4),
-                2 * (i % 4) + 1,
-                2 * (i % 4 + 4),
-                2 * (i % 4 + 4) + 1,
-            ]:
-                perm1.append(16 * row + col + 8 * block)
-        for j in range(4):
-            perm.extend([p + 256 * j for p in perm1])
-    perm = np.array(perm)
-    interleave = np.array([0, 2, 4, 6, 1, 3, 5, 7])
-    perm = perm.reshape((-1, 8))[:, interleave].ravel()
-    perm = torch.from_numpy(perm)
-    scale_perm = []
-    for i in range(8):
-        scale_perm.extend([i + 8 * j for j in range(8)])
-    scale_perm_single = []
-    for i in range(4):
-        scale_perm_single.extend([2 * i + j for j in [0, 1, 8, 9, 16, 17, 24, 25]])
-    return perm, scale_perm, scale_perm_single
-
-
-_perm, _scale_perm, _scale_perm_single = _get_perms()
-_perm_2_4, _scale_perm_2_4, _scale_perm_single_2_4 = _get_perms_2_4()
-
-
-def mask_creator(tensor):
-    """
-    Class for creating N:M sparsity masks.
-    Masks will be created using the N:M ratio, where for every block of M weights,
-    N will be pruned based on ranked weight value. Each mask will correspond to the given tensor.
-
-    :param N: The number of weights in a group to keep
-    :param M: The size of a weight group
-    """
-    N = 2
-    M = 4
-
-    mask = None
-    # for i, tensor in enumerate(tensors):
-    if tensor.numel() % M != 0:
-        raise ValueError(
-            f"Tensor of size {tensor.shape} can't be evenly divided into " f"{M} groups"
-        )
-
-    num_groups = tensor.numel() // M
-
-    # N:M sparsity for linear layers
-    tensor_temp = tensor.detach().abs().reshape(num_groups, M)
-    index = torch.argsort(tensor_temp, dim=1)[:, : int(M - N)]
-
-    w_b = torch.ones(tensor_temp.shape, device=tensor_temp.device)
-    mask = w_b.scatter_(dim=1, index=index, value=0).reshape(tensor.shape)
-
-    return mask
-
-
-# This function converts dense matrix into sparse semi-structured
-# representation, producing "compressed" matrix, in the layout used by
-# CUTLASS backend, and corresponding metadata matrix.
-def sparse_semi_structured_from_dense_cutlass(dense):
-    if dense.dim() != 2:
-        raise RuntimeError(
-            f"Expected 2-dimensional dense tensor, got {dense.dim()}-dimensional tensor"
-        )
-
-    m, k = dense.shape
-    device = dense.device
-
-    meta_dtype = torch.int8
-    if dense.dtype == torch.int8:
-        meta_dtype = torch.int32
-    elif dense.dtype in [torch.half, torch.bfloat16, torch.float, torch.int32]:
-        meta_dtype = torch.int16
-    else:
-        raise RuntimeError(f"Invalid datatype {dense.dtype} of dense matrix")
-    quadbits_per_meta_elem = meta_dtype.itemsize * 8 // 4
-    if quadbits_per_meta_elem not in (4, 8):
-        raise RuntimeError("Invalid number of elements per meta element calculated")
-
-    if meta_dtype == torch.int32:
-        if m % 16 != 0:
-            raise RuntimeError(
-                f"Number of rows of dense matrix {m} must be divisible by 16"
-            )
-    else:
-        if m % 32 != 0:
-            raise RuntimeError(
-                f"Number of rows of dense matrix {m} must be divisible by 32"
-            )
-    if k % (4 * quadbits_per_meta_elem) != 0:
-        raise RuntimeError(
-            f"Number of columns of dense matrix {k} must be divisible by {4 * quadbits_per_meta_elem}"
-        )
-
-    if dense.dtype != torch.float:
-        ksparse = 4
-        dense_4 = dense.view(-1, k // ksparse, ksparse)
-        m0, m1, m2, m3 = (dense_4 != 0).unbind(-1)
-    else:
-        ksparse = 2
-        dense_2 = dense.view(-1, k // ksparse, ksparse)
-        m0, m2 = m1, m3 = (dense_2 != 0).unbind(-1)
-    meta_ncols = k // (ksparse * quadbits_per_meta_elem)
-
-    # Encoding quadruples of True/False values as follows:
-    #     [True,  True,  False, False] -> 0b0100
-    #     [True,  False, True,  False] -> 0b1000
-    #     [False, True,  True,  False] -> 0b1001
-    #     [True,  False, False, True ] -> 0b1100
-    #     [False, True,  False, True ] -> 0b1101
-    #     [False, False, True,  True ] -> 0b1110
-    # Thus, lower two bits in the encoding are index of the True value
-    # at the lowest index in the quadruple, and the higher two bits in
-    # the encoding are index of the other True value in the quadruple.
-    # In case there are less than two True values, than False value or
-    # values at some index or indices are considered True for the
-    # encoding.  In case there are more than two True values, then the
-    # excess True value(s) at some indices are considered False for
-    # the encoding.  The exact encodings used for these cases are as
-    # follows:
-    #     [False, False, False, False] -> 0b1110
-    #     [False, False, False, True ] -> 0b1110
-    #     [False, False, True,  False] -> 0b1110
-    #     [False, True,  False, False] -> 0b1001
-    #     [False, True,  True,  True ] -> 0b1101
-    #     [True,  False, False, False] -> 0b1000
-    #     [True,  False, True,  True ] -> 0b1100
-    #     [True,  True,  False, True ] -> 0b0100
-    #     [True,  True,  True,  False] -> 0b0100
-    #     [True,  True,  True,  True ] -> 0b0100
-    # These particular encodings are chosen, with the help of Espresso
-    # logic minimizer software, for the purpose of minimization of
-    # corresponding Boolean functions, that translate non-zero flags
-    # into encoding bits.  Note also possible choices for the first
-    # and last of these encodings were limited only to (0b0100,
-    # 0b1110), in order to produce valid encodings for 1:2 sparsity
-    # case.
-
-    expr0 = m0 & m1
-    expr1 = ~m0 & m1
-    expr2 = ~m0 & ~m1
-    bit0 = expr1
-    bit1 = expr2
-    bit2 = expr0 | expr2 | m3
-    bit3 = expr1 | ~m1
-    idxs0 = bit0 | (bit1.to(torch.int64) << 1)
-    idxs1 = bit2 | (bit3.to(torch.int64) << 1)
-
-    if dense.dtype != torch.float:
-        sparse0 = dense_4.gather(-1, idxs0.unsqueeze(-1))  # type: ignore[possibly-undefined]
-        sparse1 = dense_4.gather(-1, idxs1.unsqueeze(-1))
-        sparse = torch.stack((sparse0, sparse1), dim=-1).view(m, k // 2)
-    else:
-        sparse = dense_2.gather(-1, idxs0.unsqueeze(-1) // 2).view(m, k // 2)  # type: ignore[possibly-undefined]
-
-    meta_4 = idxs0 | (idxs1 << 2)
-    meta_n = meta_4.view((-1, meta_ncols, quadbits_per_meta_elem)).to(meta_dtype)
-
-    if quadbits_per_meta_elem == 4:
-        meta = (
-            meta_n[:, :, 0]
-            | (meta_n[:, :, 1] << 4)
-            | (meta_n[:, :, 2] << 8)
-            | (meta_n[:, :, 3] << 12)
-        )
-    elif quadbits_per_meta_elem == 8:
-        meta = (
-            meta_n[:, :, 0]
-            | (meta_n[:, :, 1] << 4)
-            | (meta_n[:, :, 2] << 8)
-            | (meta_n[:, :, 3] << 12)
-            | (meta_n[:, :, 4] << 16)
-            | (meta_n[:, :, 5] << 20)
-            | (meta_n[:, :, 6] << 24)
-            | (meta_n[:, :, 7] << 28)
-        )
-
-    # Reorder meta tensor elements.
-    meta_reordered = meta.new_empty((m * meta_ncols,))  # type: ignore[possibly-undefined]
-    meta_offsets = _calculate_meta_reordering_scatter_offsets(
-        m, meta_ncols, meta_dtype, device
-    )
-    meta_reordered.scatter_(0, meta_offsets, meta.view(-1))
-
-    return (sparse, meta_reordered.view(m, meta_ncols))
-
-
-# This is PyTorch implementation of main part of reorder_meta()
-# function, from tools/util/include/cutlass/util/host_reorder.h file
-# of CUTLASS source tree.  Furthermore, CUTLASS template for sparse
-# GEMM decides upon layout of this matrix, and at the moment for the
-# sparse GEMM executed on tensor cores, this is layout described by
-# ColumnMajorInterleaved<2> data structure, in
-# include/cutlass/layout/matrix.h of CUTLASS source tree.  The
-# reordering of meta matrix into meta_reordered matrix calculated
-# according to these segments of CUTLASS code is re-implemented here.
-# Note that this calculation produces offsets for scattering metadata
-# matrix elements into reordered metadata matrix elements (or,
-# equivalently, for gathering reordered metadata matrix element back
-# into metadata matrix elements).
-def _calculate_meta_reordering_scatter_offsets(m, meta_ncols, meta_dtype, device):
-    dst_rows = torch.arange(0, m, device=device)[:, None].repeat(1, meta_ncols)
-    dst_cols = torch.arange(0, meta_ncols, device=device).repeat(m, 1)
-
-    # Reorder the rows, then swizzle the 2x2 blocks.
-    group_x = 64
-    group_y = 32 if meta_dtype.itemsize == 2 else 16
-
-    dst_rows = (
-        dst_rows // group_x * group_x
-        + (dst_rows % 2) * 2
-        + (dst_rows % 8) // 4
-        + ((dst_rows % group_y) % 4) // 2 * 32
-        + ((dst_rows % group_x) // 8) * 4
-    )
-
-    topright = ((dst_rows % 2 == 0) & (dst_cols % 2 == 1)).to(torch.int8)
-    bottomleft = ((dst_rows % 2 == 1) & (dst_cols % 2 == 0)).to(torch.int8)
-    dst_rows += topright - bottomleft
-    dst_cols -= topright - bottomleft
-
-    # Assumed that meta tensor is to be stored in CUTLASS
-    # InterleavedColumnMajor layout, and reverse engineered
-    # corresponding code to store values into this tensor.
-    interleave = 2
-    cols_maj = dst_cols // interleave
-    cols_min = dst_cols % interleave
-    return (cols_maj * m * interleave + dst_rows * interleave + cols_min).view(-1)
-
-
-class Layer_2_4(nn.Module):
-    """PyTorch compatible Marlin 2:4 layer; 4-bit (symmetric grouped) linear layer without bias."""
-
-    def __init__(self, infeatures, outfeatures, groupsize=-1):
-        """Create an empty Marlin layer.
-        @infeatures: number of input features (must be divisible by 128)
-        @outfeatures: number of output features (must be divisible by 256)
-        @groupsize: quantization groupsize (must be -1 or 128)
-        """
-        super().__init__()
-        if groupsize not in [-1, 128]:
-            raise ValueError("Only groupsize -1 and 128 are supported.")
-        if infeatures % 128 != 0 or outfeatures != 256 == 0:
-            raise ValueError(
-                "`infeatures` must be divisible by 64 and `outfeatures` by 256."
-            )
-        if groupsize == -1:
-            groupsize = infeatures
-        if infeatures % groupsize != 0:
-            raise ValueError("`infeatures` must be divisible by `groupsize`.")
-        self.k = infeatures
-        self.n = outfeatures
-        self.groupsize = groupsize
-        self.register_buffer(
-            "B", torch.empty((self.k // 16, self.n * 16 // 8), dtype=torch.int)
-        )
-        self.register_buffer(
-            "meta", torch.empty((self.n, self.k // 16), dtype=torch.int16)
-        )
-        self.register_buffer(
-            "s", torch.empty((self.k // groupsize, self.n), dtype=torch.half)
-        )
-        # 128 is currently the minimum `tile_n`, hence it gives the maximum workspace size; 16 is the default `max_par`
-        self.register_buffer(
-            "workspace",
-            torch.zeros(
-                self.n // 128 * 16, dtype=torch.int32, device=torch.device("cuda:0")
+        test_utils = ["test_schema", "test_autograd_registration", "test_faketensor", "test_aot_dispatch_dynamic"]
+        opcheck(
+            torch.ops.torchao.marlin_24_mm,
+            (
+                inputs, sparse_w_int4, meta, out, scales, prob_m, prob_n, prob_k, 
+                workspace, group_size, device, thread_k, thread_m, sms, max_par
             ),
-            persistent=False,
+            test_utils=test_utils,
         )
 
-    def forward(self, A):
-        # C = torch.empty(  NOTE(diogo): Remove this maybe?
-        #     A.shape[:-1] + (self.s.shape[1],), dtype=A.dtype, device=A.device
-        # )
-
-        C = torchao.ops.marlin_24_mm(
-            A.view((-1, A.shape[-1])),
-            self.B,
-            self.meta,
-            # C.view((-1, C.shape[-1])),  NOTE(diogo): Remove this maybe?
-            self.s,
-            self.workspace,
-        )
-        # mul_2_4(A, self.B, self.meta, C, self.s, self.workspace)
-        return C
-
-    def pack(self, linear, scales, trans=False):
-        """Pack a fake-quantized linear layer into this actual Marlin representation.
-        @linear: fake-quantized `torch.nn.Linear` layer to convert (must be of type `torch.half`)
-        @scales: corresponding quantization scales of shape `(infeatures, groups)`
-        """
-        if linear.weight.dtype != torch.half:
-            raise ValueError("Only `torch.half` weights are supported.")
-        if trans:
-            perm, scale_perm, scale_perm_single = (
-                _perm_2_4,
-                _scale_perm_2_4,
-                _scale_perm_single_2_4,
-            )
-        else:
-            perm, scale_perm, scale_perm_single = _perm, _scale_perm, _scale_perm_single
-        tile = 16
+    def _gen_values(self, m, n, k, group_size):
         maxq = 2**4 - 1
-        s = scales
-        w = linear.weight.data
-        if self.groupsize != self.k:
-            w = w.reshape((-1, self.groupsize, self.n))
+        inputs = torch.randn((n, k), dtype=torch.half, device="cuda")
+        w = torch.randn((m, k), dtype=torch.half, device="cuda")
+
+        w = w.t()
+        if group_size != -1:
+            w = w.reshape((-1, group_size, m))
             w = w.permute(1, 0, 2)
-            w = w.reshape((self.groupsize, -1))
-            s = s.reshape((1, -1))
-        w = torch.round(w / s).int()
+            w = w.reshape((group_size, -1))
+
+        scales = torch.max(torch.abs(w), 0, keepdim=True)[0]
+        scales *= 2 / maxq
+
+        w = torch.round(w / scales).int()
         w += (maxq + 1) // 2
         w = torch.clamp(w, 0, maxq)
 
-        if self.groupsize != self.k:
-            w = w.reshape((self.groupsize, -1, self.n))
-            w = w.permute(1, 0, 2)
-            w = w.reshape((self.k, self.n)).contiguous()
-            s = s.reshape((-1, len(scale_perm)))[:, scale_perm]
-        else:
-            s = s.reshape((-1, len(scale_perm_single)))[:, scale_perm_single]
+        w_fp16 = (w - (maxq + 1) // 2).half() * scales
+        scales = scales.reshape((-1, m)).contiguous()
 
+        if group_size != -1:
+
+            def reshape(w):
+                w = w.reshape((group_size, -1, m))
+                w = w.permute(1, 0, 2)
+                w = w.reshape((k, m)).contiguous()
+                return w
+
+            w_fp16 = reshape(w_fp16)
+            w = reshape(w)
+        
         mask = mask_creator(w.T).cuda().bool()
-        w = mask * w.T
-        w, meta = sparse_semi_structured_from_dense_cutlass(w)
-        w = w.t()
-        self.k = self.k // 2
-        self.groupsize = self.groupsize // 2
+        sparse_w_fp16_ref = (mask * w_fp16.T).T
 
-        s = s.reshape((-1, self.n)).contiguous()
-        w = w.reshape((self.k // tile, tile, self.n // tile, tile))
-        w = w.permute((0, 2, 1, 3))
-        w = w.reshape((self.k // tile, self.n * tile))
-        res = w
-        res = res.reshape((-1, perm.numel()))[:, perm].reshape(res.shape)
-        q = np.zeros((res.shape[0], res.shape[1] // 8), dtype=np.uint32)
-        res = res.cpu().numpy().astype(np.uint32)
-        for i in range(8):
-            q |= res[:, i::8] << 4 * i
+        return inputs, sparse_w_fp16_ref, w_fp16, scales
 
-        q = torch.from_numpy(q.astype(np.int32)).to(w.device)
-        self.B[:, :] = q.to(self.B.device)
-        self.s[:, :] = s.to(self.s.device)
-        self.meta[:, :] = meta.to(self.meta.device)
+    def _run_problem(self, m, n, k, thread_k, thread_m, group_size=-1):
+        inputs, sparse_w_fp16_ref, w_fp16, scales = self._gen_values(m, n, k, group_size)
+        out_ref = torch.matmul(inputs, sparse_w_fp16_ref)
 
+        # If no groupsize is provided, we assume it is the same as the in_features of the weights
+        # https://github.com/IST-DASLab/Sparse-Marlin/blob/c2ffa2395a3ada26c8cb7f910a5ec65bd3ce288a/marlin/__init__.py#L290
+        if group_size == -1:
+            group_size = k
 
-def gen_quant4_NT(m, k, groupsize=-1):
-    maxq = 2**4 - 1
-    w = torch.randn((m, k), dtype=torch.half, device=DEV)
-    k_sp = k // 2
+        w_int4, scales = fp16_to_int4_marlin_format(w_fp16, scales, group_size)
+        sparse_w_int4, scales, meta = pack_to_sparse_marlin_24(w_int4, scales, self.TILES)
 
-    w = w.t()
-    if groupsize != -1:
-        w = w.reshape((-1, groupsize, m))
-        w = w.permute(1, 0, 2)
-        w = w.reshape((groupsize, -1))
-    s = torch.max(torch.abs(w), 0, keepdim=True)[0]
-    s *= 2 / maxq
-    w = torch.round(w / s).int()
-    w += (maxq + 1) // 2
-    w = torch.clamp(w, 0, maxq)
-    ref = (w - (maxq + 1) // 2).half() * s
-    if groupsize != -1:
-
-        def reshape(w):
-            w = w.reshape((groupsize, -1, m))
-            w = w.permute(1, 0, 2)
-            w = w.reshape((k, m)).contiguous()
-            return w
-
-        ref = reshape(ref)
-        w = reshape(w)
-
-    mask = mask_creator(w.T).cuda().bool()
-    uncompress = (mask * ref.T).T
-
-    s = s.reshape((-1, m)).contiguous()
-    linear = nn.Linear(k, m)
-    linear.weight.data = ref
-
-    layer = Layer_2_4(256, 256, groupsize=groupsize)
-    if groupsize == -1:
-        groupsize = k
-    layer.k = k
-    layer.n = m
-    layer.groupsize = groupsize
-    layer.B = torch.empty((k_sp // 16, m * 16 // 8), dtype=torch.int, device=DEV)
-    layer.meta = torch.empty((m, k // 16), dtype=torch.int16, device=DEV)
-    layer.s = torch.empty((k_sp // (groupsize // 2), m), dtype=torch.half, device=DEV)
-    layer.pack(linear, s, True)
-    q = layer.B
-    s = layer.s
-    meta = layer.meta
-
-    return uncompress, q, s, meta
-
-
-class Marlin24MM(TestCase):
-
-    def _run_problem(self, m, n, k, thread_k, thread_m, groupsize=-1):
-        A = torch.randn((n, k), dtype=torch.half, device=DEV)
-        B_ref, B, s, meta = gen_quant4_NT(m, k, groupsize=groupsize)
-        C_ref = torch.matmul(A, B_ref)
-
-        workspace = torch.zeros(m // 128 * 16, device=DEV, dtype=torch.int32)
-        C = torchao.ops.marlin_24_mm(A, B, meta, s, workspace, thread_k, thread_m, -1)
+        workspace = torch.zeros(m // 128 * 16, device="cuda", dtype=torch.int32)
+        out = marlin_24_mm(inputs, sparse_w_int4, meta, scales, workspace, thread_k, thread_m, -1)
         torch.cuda.synchronize()
 
         self.assertLess(
-            torch.mean(torch.abs(C - C_ref)) / torch.mean(torch.abs(C_ref)), 0.002
+            torch.mean(torch.abs(out - out_ref)) / torch.mean(torch.abs(out_ref)), 0.002
         )
+
+        # TODO(diogo): Enable this check once I understand how to make `out` mutable
+        # self._op_check(inputs, sparse_w_int4, meta, scales, workspace, thread_k, thread_m)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_correctness(self):
@@ -812,11 +443,6 @@ class Marlin24MM(TestCase):
                     for thread_shape in [(128, 128), (64, 256)]:
                         self._run_problem(n, m, k, *thread_shape, groupsize)
 
-def test_marlin_24_mm():
-    # TODO(diogo): Add test for opcheck
-    pass
-
-###########################################################################################
 
 if __name__ == "__main__":
     run_tests()

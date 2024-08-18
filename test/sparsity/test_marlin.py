@@ -17,15 +17,15 @@ class TestSparseMarlin(TestCase):
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="Need CUDA available")
     def test_quant_sparse_marlin_layout_e2e(self):
-        input = torch.rand((128, 512)).bfloat16().cuda()
+        input = torch.randn((16, 4096), dtype=torch.float16, device="cuda")
         model = (
             nn.Sequential(
-                nn.Linear(512, 4096),
-                nn.Linear(4096, 256),
+                nn.Linear(4096, 21504),
+                nn.Linear(21504, 256),
                 nn.ReLU(),
                 nn.Linear(256, 128),
             )
-            .bfloat16()
+            .half()
             .cuda()
         )
 
@@ -33,7 +33,7 @@ class TestSparseMarlin(TestCase):
         model_copy = copy.deepcopy(model)
 
         # Baseline to match against
-        quantize_(model_copy, int4_weight_only())
+        quantize_(model_copy.bfloat16(), int4_weight_only())
         dense_result = model_copy(input)
 
         # Sparse + quantized
@@ -60,9 +60,6 @@ class TestSparseMarlin(TestCase):
 
         assert torch.equal(w_int4, unpacked_w_int4), "Unpacked weights do not match original weights"
         assert torch.equal(scales, unpacked_scales), "Unpacked scales do not match original scales"
-
-
-    # TODO(diogo): Add rest of tests from sparse marlin repo
 
 
 if __name__ == "__main__":

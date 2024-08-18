@@ -165,8 +165,14 @@ def marlin_24_mm(
     x: Tensor,
     weight_marlin: Tensor,
     meta: Tensor,
+    out: Tensor,
     s: Tensor,
+    prob_m: int,
+    prob_n: int,
+    prob_k: int,
     workspace: Tensor,
+    group_size: int,
+    device: int,
     thread_k: int = -1, 
     thread_m: int = -1, 
     sms: int = -1, 
@@ -189,32 +195,27 @@ def marlin_24_mm(
     Returns:
         output matrix of shape `(n, m)` in column-major layout.
     """
-    out = torch.empty((x.size(0), s.size(1)), dtype=x.dtype, device=x.device)
-
-    # From: https://github.com/IST-DASLab/Sparse-Marlin/blob/c2ffa2395a3ada26c8cb7f910a5ec65bd3ce288a/marlin/marlin_cuda.cpp#L66
-    prob_n = x.size(0)
-    prob_m = out.size(1)
-    prob_k = x.size(1)
-    group_size = -1 if s.size(0) == 1 else int(prob_k / 2 / s.size(0))
-    device = torch.cuda.current_device()
-
-    torch.ops.torchao.marlin_24_mm.default(
+    return torch.ops.torchao.marlin_24_mm.default(
         x, weight_marlin, meta, out, 
         s, prob_m, prob_n, prob_k, 
         workspace, group_size, device,
         thread_k, thread_m, sms, max_par
     )
 
-    return out
-
 
 @register_custom_op(f"torchao::marlin_24_mm")
 def _(
-    weight_marlin: Tensor,
     x: Tensor,
+    weight_marlin: Tensor,
     meta: Tensor,
+    out: Tensor,
     s: Tensor,
+    prob_m: int,
+    prob_n: int,
+    prob_k: int,
     workspace: Tensor,
+    group_size: int,
+    device: int,
     thread_k: int = -1, 
     thread_m: int = -1, 
     sms: int = -1, 
