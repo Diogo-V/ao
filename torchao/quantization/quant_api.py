@@ -27,7 +27,8 @@ from torchao.dtypes import (
     TensorCoreTiledLayoutType, 
     PlainLayoutType,
     AffineQuantizedTensor,
-    SemiSparseLayoutType
+    SemiSparseLayoutType,
+    MarlinSparseLayoutType
 )
 from torchao.utils import (
     TORCH_VERSION_AT_LEAST_2_4,
@@ -371,8 +372,6 @@ def int8_dynamic_activation_int4_weight(group_size=32):
     return insert_subclass
 
 
-# TODO(diogo): Discuss API with folks
-from torchao.dtypes import MarlinSparseLayoutType
 def int4_weight_only(group_size=128, layout_type = TensorCoreTiledLayoutType(inner_k_tiles=8)):
     """
     Applies uint4 weight-only asymmetric per-group quantization to linear layers, using
