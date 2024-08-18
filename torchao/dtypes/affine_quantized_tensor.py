@@ -998,14 +998,18 @@ def _linear_fp_act_int4_weight_sparse_marlin_impl(input_tensor, weight_tensor, b
     scale = weight_tensor.layout_tensor.scale
     meta = weight_tensor.layout_tensor.meta
     original_shape = weight_tensor.layout_tensor.original_shape
-    workspace = torch.zeros(original_shape[-1] // 128 * 16, device=sparse_w_int4.device, dtype=torch.int32)
+
+    # 128 is currently the minimum `tile_n`, hence it gives the maximum workspace size
+    max_par = 16
+    workspace = torch.zeros(original_shape[-1] // 128 * max_par, device=sparse_w_int4.device, dtype=torch.int32)
 
     out = marlin_24_mm(
         input_tensor,
         sparse_w_int4,
         meta,
         scale,
-        workspace
+        workspace,
+        max_par=max_par,
     )
 
     if bias is not None:

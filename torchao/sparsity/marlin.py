@@ -57,7 +57,12 @@ def marlin_24_mm(
         workspace, group_size, device,
         thread_k, thread_m, sms, max_par
     )
-    assert err == 0, "Error in Marlin 2:4 MM kernel"
+
+    # https://github.com/IST-DASLab/Sparse-Marlin/blob/c2ffa2395a3ada26c8cb7f910a5ec65bd3ce288a/marlin/marlin_cuda.cpp#L36
+    if err == 1:
+        raise RuntimeError(f"Problem (m={prob_m}, n={prob_n}, k={prob_k}), not compatible with thread_k={thread_k}, thread_n={thread_m}")
+    elif err == 2:
+        raise RuntimeError(f"No kernel implementation for thread_k={thread_k}, thread_n={thread_m}, group_size={group_size}")
 
     return out
 

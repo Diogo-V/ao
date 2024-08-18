@@ -233,6 +233,16 @@ def _(
         lambda: f"weight_marlin should have 2x the number of columns as x, got {weight_marlin.size(1)} and {x.size(1)}",
     )
 
-    # TODO(diogo): Add more checks here
+    # Check if the computed group size is compatible with the scales tensor
+    torch._check(
+        group_size != -1 and group_size * s.size(0) != (prob_k / 2),
+        lambda: f"group_size={group_size} not compatible with {s.size(0)} groups.",
+    )
+
+    # Check if the workspace is large enough
+    torch._check(
+        workspace.numel() < prob_m / 128 * max_par,
+        lambda: f"workspace must be of size at least {prob_m / 128 * max_par}."
+    )
 
     return torch.empty((x.size(0), s.size(1)), dtype=x.dtype, device=x.device)
