@@ -106,60 +106,6 @@ def pack_to_sparse_marlin_24(
     return q, s, meta
 
 
-def fp16_to_int4_marlin_format(weight: torch.Tensor, scales: torch.Tensor, group_size: int = -1) -> Tuple[torch.Tensor, torch.Tensor]:
-    maxq = 2**4 - 1
-    in_features, out_features = weight.shape
-    s = scales
-    w = weight
-
-    if group_size != in_features:
-        w = w.reshape((-1, group_size, out_features))
-        w = w.permute(1, 0, 2)
-        w = w.reshape((group_size, -1))
-        s = s.reshape((1, -1))
-
-    w = torch.round(w / s).int()
-    w += (maxq + 1) // 2
-    w = torch.clamp(w, 0, maxq)
-
-    if group_size != in_features:
-        w = w.reshape((group_size, -1, out_features))
-        w = w.permute(1, 0, 2)
-        w = w.reshape((in_features, out_features)).contiguous()
-        s = s.reshape((-1, len(scale_perm)))[:, scale_perm]
-    else:
-        s = s.reshape((-1, len(scale_perm_single)))[:, scale_perm_single]
-
-    return w, s
-
-
-def fake_quantize_marlin_format(weight: torch.Tensor, group_size: int = -1) -> Tuple[torch.Tensor, torch.Tensor]:
-    maxq = 2**4 - 1
-    m, k = weight.shape
-    w = weight.to(torch.half)
-
-    w = w.t()
-    if group_size != -1:
-        w = w.reshape((-1, group_size, m))
-        w = w.permute(1, 0, 2)
-        w = w.reshape((group_size, -1))
-
-    s = torch.max(torch.abs(w), 0, keepdim=True)[0]
-    s *= 2 / maxq
-    w = torch.round(w / s).int()
-    w += (maxq + 1) // 2
-    w = torch.clamp(w, 0, maxq)
-    ref = (w - (maxq + 1) // 2).half() * s
-
-    if group_size != -1:
-        ref = ref.reshape((group_size, -1, m))
-        ref = ref.permute(1, 0, 2)
-        ref = ref.reshape((k, m)).contiguous()
-    s = s.reshape((-1, m)).contiguous()
-
-    return ref, s
-
-
 def unpack_from_sparse_marlin_24(
         q: torch.Tensor, 
         s: torch.Tensor, 
@@ -195,6 +141,33 @@ def unpack_from_sparse_marlin_24(
         return w_unpacked
 
     return unpack_weights(q, n_tiles, meta, initial_shape), unpack_scales(s)
+
+
+def fp16_to_int4_marlin_format(weight: torch.Tensor, scales: torch.Tensor, group_size: int = -1) -> Tuple[torch.Tensor, torch.Tensor]:
+    maxq = 2**4 - 1
+    in_features, out_features = weight.shape
+    s = scales
+    w = weight
+
+    if group_size != in_features:
+        w = w.reshape((-1, group_size, out_features))
+        w = w.permute(1, 0, 2)
+        w = w.reshape((group_size, -1))
+        s = s.reshape((1, -1))
+
+    w = torch.round(w / s).int()
+    w += (maxq + 1) // 2
+    w = torch.clamp(w, 0, maxq)
+
+    if group_size != in_features:
+        w = w.reshape((group_size, -1, out_features))
+        w = w.permute(1, 0, 2)
+        w = w.reshape((in_features, out_features)).contiguous()
+        s = s.reshape((-1, len(scale_perm)))[:, scale_perm]
+    else:
+        s = s.reshape((-1, len(scale_perm_single)))[:, scale_perm_single]
+
+    return w, s
 
 
 # This function converts dense matrix into sparse semi-structured
