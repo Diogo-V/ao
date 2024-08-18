@@ -175,16 +175,16 @@ def unpack_from_sparse_marlin_24(
         # NOTE: This is not yet supported in torch==2.4.0
         # If we try to perform this operation in pytorch, the following error will be raised:
         # `RuntimeError: Promotion for uint16, uint32, uint64 types is not supported, attempted to promote UInt32 and Int`
-        res_ = np.zeros((q.shape[0], q.shape[1] * 8), dtype=np.uint32)
+        res = np.zeros((q.shape[0], q.shape[1] * 8), dtype=np.uint32)
         for i in range(8):
-            res_[:, i::8] = (q.cpu().numpy() >> (4 * i)) & 0xF
-        res_ = torch.from_numpy(res_.astype(np.int32)).to(q.device)
+            res[:, i::8] = (q.cpu().numpy() >> (4 * i)) & 0xF
+        res = torch.from_numpy(res.astype(np.int32)).to(q.device)
 
-        res_ = res_.reshape((-1, perm.numel()))[:, torch.argsort(perm)].reshape(res_.shape)
+        res = res.reshape((-1, perm.numel()))[:, torch.argsort(perm)].reshape(res.shape)
         in_features, out_features = initial_shape
         in_features_sp = in_features // 2
 
-        w = res_.reshape((in_features_sp // tile, out_features // tile, tile, tile))
+        w = res.reshape((in_features_sp // tile, out_features // tile, tile, tile))
         w = w.permute((0, 2, 1, 3))
         w = w.reshape((in_features_sp, out_features))
         w = w.t()
@@ -363,7 +363,7 @@ def _sparse_semi_structured_to_dense_cutlass(sparse, meta_reordered):
     meta_nrows, meta_ncols = meta_reordered.shape
     if meta_nrows != m:
         raise RuntimeError(
-            f"Number of rows of meta matrix {meta_nrows} must be equal to number of columns of spase matrix {m}"
+            f"Number of rows of meta matrix {meta_nrows} must be equal to number of columns of sparse matrix {m}"
         )
     if meta_ncols * ksparse * quadbits_per_meta_elem != 2 * k:
         raise RuntimeError(

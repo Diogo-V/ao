@@ -577,16 +577,14 @@ class MarlinSparseAQTLayout(AQTLayout):
         )
 
     def get_plain(self):
-        # int_data_expanded, scales_expanded = unpack_from_sparse_marlin_24(
-        #     self.int_data, 
-        #     self.scale, 
-        #     self.meta, 
-        #     self.layout_type.tile, 
-        #     self.initial_shape
-        # )
-        # TODO(diogo): Figure out how to get the correct expanded data and what should be the expanded data
-        int_data_expanded = torch.randint(0, 15, self.original_shape, device=self.int_data.device).to(torch.int32)
-        scales_expanded = torch.randn(self.original_shape[1], device=self.int_data.device)
+        from torchao.sparsity.marlin import unpack_from_sparse_marlin_24  # avoid circular import
+        int_data_expanded, scales_expanded = unpack_from_sparse_marlin_24(
+            self.int_data, 
+            self.scale, 
+            self.meta, 
+            self.layout_type.tile, 
+            self.original_shape
+        )
         return int_data_expanded, scales_expanded, self.zero_point
 
     @classmethod
@@ -597,40 +595,21 @@ class MarlinSparseAQTLayout(AQTLayout):
         zero_point: torch.Tensor,
         layout_type: LayoutType,
     ):
-        from torchao.sparsity.marlin import (   # avoid circular import
-            pack_to_sparse_marlin_24, 
-            fake_quantize_marlin_format,
-            fp16_to_int4_marlin_format
-        )
+        from torchao.sparsity.marlin import pack_to_sparse_marlin_24  # avoid circular import
         assert isinstance(layout_type, MarlinSparseLayoutType)
+        w_int4 = int_data.t()
 
-        if int_data.dtype != torch.int32:
+        if w_int4.dtype != torch.int32:
             raise ValueError("Only `torch.int32` weights are supported.")
         
-        in_features, out_features = int_data.shape
+        in_features, out_features = w_int4.shape
         if in_features % 128 != 0 or out_features != 256 == 0:
             raise ValueError(
                 "`in_features` must be divisible by 64 and `out_features` by 256."
             )
 
-        group_size = 128  # TODO(diogo): Put this in layout?
-
-        ##### TODO(diogo): Working on getting this to work directly with the int4 that is given
-        w_float = dequantize_affine(int_data, (1, group_size), scale, zero_point, int_data.dtype, 0, 15, ZeroPointDomain.FLOAT, output_dtype=torch.bfloat16)
-        w_float = w_float.detach()
-        ######
-
-        w_float, scales = fake_quantize_marlin_format(w_float, group_size=group_size)
-
-        # If no group_size is provided, we assume it is the same as the in_features of the weights
-        # https://github.com/IST-DASLab/Sparse-Marlin/blob/c2ffa2395a3ada26c8cb7f910a5ec65bd3ce288a/marlin/__init__.py#L290
-        if group_size == -1:
-            group_size = int_data.shape[0]
-
-        w_int4, scales = fp16_to_int4_marlin_format(w_float, scales, group_size=group_size)
-        int_data_compressed, scales, meta = pack_to_sparse_marlin_24(w_int4, scales, layout_type.tile)
-
-        return cls(int_data_compressed, scales, zero_point, meta, layout_type, int_data.shape)
+        int_data_compressed, scale, meta = pack_to_sparse_marlin_24(w_int4, scale, layout_type.tile)
+        return cls(int_data_compressed, scale, zero_point, meta, layout_type, w_int4.shape)
     
     def get_layout_type(self) -> LayoutType:
         return self.layout_type
@@ -1007,7 +986,7 @@ def _linear_fp_act_int4_weight_sparse_marlin_check(input_tensor, weight_tensor, 
         _aqt_is_uint4(weight_tensor) and
         input_tensor.dtype == torch.float16 and
         len(weight_tensor.shape) == 2 and
-        weight_tensor.zero_point_domain == ZeroPointDomain.FLOAT and
+        weight_tensor.zero_point_domain == ZeroPointDomain.INT and
         isinstance(weight_tensor.layout_type, MarlinSparseLayoutType)
     )
 

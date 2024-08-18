@@ -404,6 +404,12 @@ def int4_weight_only(group_size=128, layout_type = TensorCoreTiledLayoutType(inn
         zero_point_dtype = torch.bfloat16
         zero_point_domain = ZeroPointDomain.FLOAT
 
+        # Sparse Marlin only supports symmetric quantization
+        if isinstance(layout_type, MarlinSparseLayoutType):
+            mapping_type = MappingType.SYMMETRIC
+            preserve_zero = True
+            zero_point_domain = ZeroPointDomain.INT
+
         return to_affine_quantized(weight, mapping_type, block_size, target_dtype, quant_min, quant_max, eps, zero_point_dtype=zero_point_dtype, preserve_zero=preserve_zero, zero_point_domain=zero_point_domain, layout_type=layout_type)
 
     if isinstance(layout_type, MarlinSparseLayoutType) and group_size != 128:
