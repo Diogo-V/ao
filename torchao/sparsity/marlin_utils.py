@@ -4,7 +4,8 @@ from typing import Tuple
 
 from torchao.sparsity.aaa import (
     mask_creator, 
-    sparse_semi_structured_from_dense_cutlass
+    sparse_semi_structured_from_dense_cutlass,
+    sparse_semi_structured_to_dense_cutlass
 )
 from torchao.sparsity.bbb import (
     marlin_24_perm, 
@@ -32,14 +33,15 @@ def pack_to_marlin_24(
     )
 
     in_features_comp = in_features // 2
+    # assert decompress_quantized_24_weight(q_w_24_comp, meta, in_features_comp, out_features, num_bits) == q_w_24
 
     # Reformat to marlin
-    marlin_24_q_w_comp = marlin_weights(
+    marlin_24_q_w_comp = to_marlin_weights(
         q_w_24_comp, in_features_comp, out_features,
         num_bits, marlin_24_perm[num_bits]
     )
 
-    marlin_24_s = marlin_permute_scales(
+    marlin_24_s = to_marlin_scales(
         scales, in_features, out_features, group_size,
         marlin_24_scale_perm[num_bits],
         marlin_24_scale_perm_single[num_bits]
@@ -54,8 +56,57 @@ def unpack_from_marlin_24(
         meta: torch.Tensor, 
         tiles: int, 
         original_shape: torch.Size,
+        group_size: int,
+        num_bits: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+    # Unpacks the scales 
+    unpacked_scales = from_marlin_scale(
+        scales, *original_shape, group_size,
+        marlin_24_scale_perm[num_bits],
+        marlin_24_scale_perm_single[num_bits]
+    )
+
+
+def from_marlin_weights(q_w_24, size_k, size_n, perm) -> torch.Tensor:
+    # TODO(diogo): WIP
     pass
+
+
+def from_marlin_scale(s, size_k, size_n, group_size, scale_perm, scale_perm_single) -> torch.Tensor:
+    s = s.reshape((-1, size_n)).contiguous()
+
+    if group_size < size_k and group_size != -1:
+        reverse_scale_perms = torch.tensor(scale_perm).argsort()
+        s = s.reshape((-1, len(scale_perm)))[:, reverse_scale_perms]
+    else:
+        reverse_scale_perms = torch.tensor(scale_perm_single).argsort()
+        s = s.reshape((-1, len(scale_perm_single)))[:, scale_perm_single]
+
+    return s.reshape(-1).contiguous()
+
+
+# TODO(diogo): WIP
+def decompress_quantized_24_weight(q_24_comp, meta, size_k, size_n, num_bits) -> torch.Tensor:
+    assert q_24_comp.shape == (size_k, size_n)
+
+    # Resize meta back to its original shape
+    meta = meta.resize_(meta.shape[0] * 2, meta.shape[1] // 2)
+
+    # Remove zp to normalize over 0
+    max_q_val = (1 << num_bits) - 1
+    zp = (max_q_val + 1) // 2
+    q_24_no_zp_comp = q_24_comp - zp
+
+    # Decompress
+    q_24_no_zp_comp = q_24_no_zp_comp.t().contiguous()
+    q_24_no_zp = sparse_semi_structured_to_dense_cutlass(q_24_no_zp_comp, meta)
+    q_24_no_zp = q_24_no_zp.t().contiguous()
+
+    # Restore zp
+    q_24 = q_24_no_zp + zp
+
+    return q_24
 
 
 def marlin_permute_weights(q_w, size_k, size_n, perm, tile=MARLIN_TILE):
@@ -73,7 +124,7 @@ def marlin_permute_weights(q_w, size_k, size_n, perm, tile=MARLIN_TILE):
     return q_w
 
 
-def marlin_weights(q_w, size_k, size_n, num_bits, perm):
+def to_marlin_weights(q_w, size_k, size_n, num_bits, perm):
     # Permute
     q_w = marlin_permute_weights(q_w, size_k, size_n, perm)
 
@@ -83,8 +134,7 @@ def marlin_weights(q_w, size_k, size_n, num_bits, perm):
 
     q_w = q_w.cpu().numpy().astype(numpy.uint32)
 
-    q_packed = numpy.zeros((q_w.shape[0], q_w.shape[1] // pack_factor),
-                           dtype=numpy.uint32)
+    q_packed = numpy.zeros((q_w.shape[0], q_w.shape[1] // pack_factor), dtype=numpy.uint32)
     for i in range(pack_factor):
         q_packed |= q_w[:, i::pack_factor] << num_bits * i
 
@@ -93,22 +143,18 @@ def marlin_weights(q_w, size_k, size_n, num_bits, perm):
     return q_packed
 
 
-def marlin_permute_scales(s, size_k, size_n, group_size, scale_perm,
-                          scale_perm_single):
+def to_marlin_scales(s, size_k, size_n, group_size, scale_perm, scale_perm_single):
     if group_size < size_k and group_size != -1:
         s = s.reshape((-1, len(scale_perm)))[:, scale_perm]
     else:
         s = s.reshape((-1, len(scale_perm_single)))[:, scale_perm_single]
     s = s.reshape((-1, size_n)).contiguous()
-
     return s
 
 
 def inject_24(w, size_k, size_n):
     assert w.shape == (size_k, size_n)
-
     mask = mask_creator(w.t()).t().cuda().bool()
-
     return (mask * w).contiguous(), mask.contiguous()
 
 
@@ -122,8 +168,7 @@ def compress_quantized_24_weight(q_24, size_k, size_n, num_bits):
 
     # Compress
     q_24_no_zp = q_24_no_zp.t().contiguous()
-    q_24_no_zp_comp, meta = sparse_semi_structured_from_dense_cutlass(
-        q_24_no_zp)
+    q_24_no_zp_comp, meta = sparse_semi_structured_from_dense_cutlass(q_24_no_zp)
     q_24_no_zp_comp = q_24_no_zp_comp.t().contiguous()
 
     # Restore zp
@@ -156,17 +201,10 @@ def marlin_24_quantize(
                                                              group_size,
                                                              act_order=False)
 
-    # Compress quantized weight
-    q_w_24_comp, meta = compress_quantized_24_weight(q_w_24, size_k, size_n,
-                                                     num_bits)
-    size_k_comp = size_k // 2
-
-    # Reformat to marlin
-    marlin_24_q_w_comp = marlin_weights(q_w_24_comp, size_k_comp, size_n,
-                                        num_bits, marlin_24_perm[num_bits])
-    marlin_24_s = marlin_permute_scales(s, size_k, size_n, group_size,
-                                        marlin_24_scale_perm[num_bits],
-                                        marlin_24_scale_perm_single[num_bits])
+    # Packs to marlin 2:4
+    marlin_24_q_w_comp, marlin_24_s, meta = pack_to_marlin_24(
+        q_w_24, s, num_bits, group_size
+    )
 
     # Create result
     res_list = [w_24_ref, marlin_24_q_w_comp, meta, marlin_24_s]

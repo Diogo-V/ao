@@ -4,13 +4,13 @@ import pytest
 
 from torch import nn
 from torch.testing._internal.common_utils import TestCase, run_tests
-from torchao.utils import compute_max_diff
 from torchao.dtypes import MarlinSparseLayoutType
 from torchao.sparsity.sparse_api import apply_fake_sparsity
 from torchao.quantization.quant_api import int4_weight_only, quantize_
 from torchao.sparsity.marlin_utils import (
     pack_to_marlin_24,
     unpack_from_marlin_24,
+    inject_24
 )
 
 
@@ -32,10 +32,13 @@ class SparseMarlin24(TestCase):
             .cuda()
         )
 
+        # Baseline
+        ref_result = model(input)
+
         apply_fake_sparsity(model)
         model_copy = copy.deepcopy(model)
 
-        # Baseline to match against
+        # Quantized
         quantize_(model_copy.bfloat16(), int4_weight_only())
         dense_result = model_copy(input.bfloat16()).half()
 
@@ -43,25 +46,26 @@ class SparseMarlin24(TestCase):
         quantize_(model, int4_weight_only(layout_type=MarlinSparseLayoutType()))
         sparse_result = model(input)
 
-        max_diff = compute_max_diff(dense_result, sparse_result)
-        assert max_diff < 0.50, f"Max diff: {max_diff}"
+        error_dense = torch.mean(torch.abs(ref_result - dense_result) ** 2)
+        error_sparse = torch.mean(torch.abs(ref_result - sparse_result) ** 2)
+        assert torch.allclose(error_dense, error_sparse, atol=1e-3), "Mean error is not close"
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="Need CUDA available")
     def test_pack_unpack_equivalence(self):
         tiles = 16
         num_bits = 4
+        group_size = 128
         shape = (512, 4096)
         w_int4 = torch.randint(0, 15, shape).int().cuda()
         scales = torch.rand(4096).cuda()
 
-        # Test pack/unpack equivalence
-        sparse_w_int4, packed_scales, meta = pack_to_marlin_24(w_int4, scales, tiles, num_bits)
-        unpacked_w_int4, unpacked_scales = unpack_from_marlin_24(sparse_w_int4, packed_scales, meta, tiles, shape)
+        w_q_24, _ = inject_24(w_int4, *w_int4.shape)
 
-        # When unpacking, that values that were masked will be zeroed out. So, we need
-        # to zero out the same values in the original weights to compare
-        makeshift_mask = unpacked_w_int4 == 0
-        w_int4[makeshift_mask] = 0
+        # Test pack/unpack equivalence
+        sparse_w_int4, packed_scales, meta = pack_to_marlin_24(w_q_24, scales, num_bits, group_size)
+        unpacked_w_int4, unpacked_scales = unpack_from_marlin_24(
+            sparse_w_int4, packed_scales, meta, tiles, shape, group_size, num_bits
+        )
 
         assert torch.equal(w_int4, unpacked_w_int4), "Unpacked weights do not match original weights"
         assert torch.equal(scales, unpacked_scales), "Unpacked scales do not match original scales"
