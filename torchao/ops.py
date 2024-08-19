@@ -246,3 +246,50 @@ def _(
     )
 
     return torch.empty((x.size(0), s.size(1)), dtype=x.dtype, device=x.device)
+
+
+def marlin_24_gemm(
+    x: Tensor,
+    weight_marlin: Tensor,
+    meta: Tensor,
+    s: Tensor,
+    workspace: Tensor,
+    bits: int,
+    size_m: int,
+    size_n: int,
+    size_k: int,
+) -> Tensor:
+    """
+    Sparse Marlin 2:4 matrix multiplication. Reference: https://github.com/IST-DASLab/Sparse-Marlin/tree/main
+    Args:
+        x: input matrix of shape `(n, k/2)` in column-major layout.
+        weight_marlin: weight matrix of original shape `(m, k)` in Marlin format; see `Layer.pack()`.
+        meta: metadata information for 2:4 sparsity.
+        s: scales of shape `(n / groupsize / 2, m)`.
+        workspace: tensor with at least `m / 128 * max_par` entries that are all zero.
+        thread_k:  size of a thread_tile in `A` (can usually be left as auto -1).
+        thread_m: size of a thread_tile in `A` (can usually be left as auto -1).
+        sms: number of SMs to use for the kernel (can usually be left as auto -1).
+        max_par: maximum number of batch 64 problems to solve in parallel for large input sizes.
+    Returns:
+        output matrix of shape `(n, m)` in column-major layout.
+    """
+    return torch.ops.torchao.marlin_24_gemm.default(
+        x, weight_marlin, meta, s, workspace, bits, size_m, size_n, size_k
+    )
+
+
+@register_custom_op(f"torchao::marlin_24_gemm")
+def _(
+    x: Tensor,
+    weight_marlin: Tensor,
+    meta: Tensor,
+    s: Tensor,
+    workspace: Tensor,
+    bits: int,
+    size_m: int,
+    size_n: int,
+    size_k: int,
+) -> Tensor:
+    # NOTE: Checks in kernel
+    return torch.empty((x.size(0), s.size(1)), dtype=x.dtype, device=x.device)

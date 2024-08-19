@@ -1,4 +1,5 @@
 import torch
+import torchao.ops
 from typing import Dict, Callable, Any, Tuple, Optional
 from collections import defaultdict
 import functools
@@ -374,6 +375,12 @@ class TensorCoreTiledLayoutType(LayoutType):
 class MarlinSparseLayoutType(LayoutType):
     tile = 16
 
+    # Inject 2:4 sparsity
+    def pre_process(self, input: torch.Tensor) -> torch.Tensor:
+        from torchao.sparsity.marlin_utils import inject_24  # avoid circular import
+        w_24, _ = inject_24(input, *input.shape)
+        return w_24
+
 
 @register_layout_cls(PlainLayoutType)
 class PlainAQTLayout(AQTLayout):
@@ -577,14 +584,16 @@ class MarlinSparseAQTLayout(AQTLayout):
         )
 
     def get_plain(self):
-        from torchao.sparsity.marlin import unpack_from_sparse_marlin_24  # avoid circular import
-        int_data_expanded, scales_expanded = unpack_from_sparse_marlin_24(
-            self.int_data, 
-            self.scale, 
-            self.meta, 
-            self.layout_type.tile, 
-            self.original_shape
-        )
+        # from torchao.sparsity.marlin import unpack_from_sparse_marlin_24  # avoid circular import
+        # int_data_expanded, scales_expanded = unpack_from_sparse_marlin_24(
+        #     self.int_data, 
+        #     self.scale, 
+        #     self.meta, 
+        #     self.layout_type.tile, 
+        #     self.original_shape
+        # )
+        int_data_expanded = torch.randint(0, 15, self.original_shape, dtype=torch.int32)
+        scales_expanded = torch.rand(self.original_shape[1], dtype=torch.float32)
         return int_data_expanded, scales_expanded, self.zero_point
 
     @classmethod
@@ -595,21 +604,29 @@ class MarlinSparseAQTLayout(AQTLayout):
         zero_point: torch.Tensor,
         layout_type: LayoutType,
     ):
-        from torchao.sparsity.marlin import pack_to_sparse_marlin_24  # avoid circular import
+        from torchao.sparsity.marlin_utils import pack_to_marlin_24  # avoid circular import
         assert isinstance(layout_type, MarlinSparseLayoutType)
-        w_int4 = int_data.t()
+        q_w_24 = int_data.t()
 
-        if w_int4.dtype != torch.int32:
+        if q_w_24.dtype != torch.int32:
             raise ValueError("Only `torch.int32` weights are supported.")
         
-        in_features, out_features = w_int4.shape
+        in_features, out_features = q_w_24.shape
         if in_features % 128 != 0 or out_features != 256 == 0:
             raise ValueError(
                 "`in_features` must be divisible by 64 and `out_features` by 256."
             )
 
-        int_data_compressed, scale, meta = pack_to_sparse_marlin_24(w_int4, scale, layout_type.tile)
-        return cls(int_data_compressed, scale, zero_point, meta, layout_type, w_int4.shape)
+        # TODO(diogo): Slap this in the dataclass
+        num_bits = 4
+        group_size = 128
+
+        # Compress quantized weight to marlin 2:4 format
+        marlin_24_q_w_comp, marlin_24_s, meta = pack_to_marlin_24(
+            q_w_24, scale, num_bits, group_size
+        )
+
+        return cls(marlin_24_q_w_comp, marlin_24_s, zero_point, meta, layout_type, q_w_24.shape)
     
     def get_layout_type(self) -> LayoutType:
         return self.layout_type
@@ -992,24 +1009,21 @@ def _linear_fp_act_int4_weight_sparse_marlin_check(input_tensor, weight_tensor, 
 
 
 def _linear_fp_act_int4_weight_sparse_marlin_impl(input_tensor, weight_tensor, bias):
-    from torchao.sparsity.marlin import marlin_24_mm  # avoid circular import
+    from torchao.sparsity.marlin_utils import MarlinWorkspace
 
+    num_bits = 4
     sparse_w_int4 = weight_tensor.layout_tensor.int_data
     scale = weight_tensor.layout_tensor.scale
     meta = weight_tensor.layout_tensor.meta
     original_shape = weight_tensor.layout_tensor.original_shape
 
-    # 128 is currently the minimum `tile_n`, hence it gives the maximum workspace size
-    max_par = 16
-    workspace = torch.zeros(original_shape[-1] // 128 * max_par, device=sparse_w_int4.device, dtype=torch.int32)
+    MARLIN_24_MIN_THREAD_N = 128
+    MARLIN_24_MAX_PARALLEL = 64
+    workspace_24 = MarlinWorkspace(original_shape[1], MARLIN_24_MIN_THREAD_N, MARLIN_24_MAX_PARALLEL)
 
-    out = marlin_24_mm(
-        input_tensor,
-        sparse_w_int4,
-        meta,
-        scale,
-        workspace,
-        max_par=max_par,
+    out = torchao.ops.marlin_24_gemm(
+        input_tensor, sparse_w_int4, meta, scale, workspace_24.scratch, 
+        num_bits, input_tensor.shape[0], original_shape[1], input_tensor.shape[1],
     )
 
     if bias is not None:

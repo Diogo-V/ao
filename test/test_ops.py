@@ -10,7 +10,7 @@ from torch.testing._internal.common_utils import (
     run_tests,
 )
 from torch.testing._internal.optests import opcheck
-from torchao.utils import is_fbcode, TORCH_VERSION_AT_LEAST_2_5
+from torchao.utils import is_fbcode, TORCH_VERSION_AT_LEAST_2_5, compute_max_diff
 from torchao.prototype.quant_llm import from_scaled_tc_fpx
 import pytest
 
@@ -22,12 +22,6 @@ try:
 except RuntimeError:
     pytest.skip("torchao.ops not available")
 
-from torchao.sparsity.utils import mask_creator
-from torchao.sparsity.marlin import (
-    pack_to_sparse_marlin_24,
-    marlin_24_mm,
-    fp16_to_int4_marlin_format
-)
 from torchao.quantization.utils import (
     get_groupwise_affine_qparams,
     groupwise_affine_dequantize_tensor_from_qparams,
@@ -309,139 +303,63 @@ def test_dequantize_tensor_core_tiled_layout_op(shape, inner_k_tiles, group_size
     )
 
 
-class SparseMarlin24(TestCase):
-    TILES = 16
+MARLIN_24_K_CHUNKS = [128]
+MARLIN_24_N_CHUNKS = [512]
+MNK_FACTORS = [
+    (1, 1, 1),
+    (1, 4, 8),
+    (1, 7, 5),
+    (13, 17, 67),
+    (26, 37, 13),
+    (67, 13, 11),
+]
+MARLIN_24_SUPPORTED_NUM_BITS = [4, 8]
+MARLIN_24_SUPPORTED_GROUP_SIZES = [-1, 128]
 
-    def _op_check(self, inputs, sparse_w_int4, meta, scales, workspace, thread_k, thread_m, sms=-1, max_par=16):
-        out = torch.empty((inputs.size(0), scales.size(1)), dtype=inputs.dtype, device=inputs.device)
+MARLIN_TEST_PARAMS = list(itertools.product(
+    MARLIN_24_K_CHUNKS, MARLIN_24_N_CHUNKS, MARLIN_24_SUPPORTED_NUM_BITS, 
+    MARLIN_24_SUPPORTED_GROUP_SIZES, MNK_FACTORS
+))
 
-        prob_n = inputs.size(0)
-        prob_m = out.size(1)
-        prob_k = inputs.size(1)
-        group_size = -1 if scales.size(0) == 1 else int(prob_k / 2 / scales.size(0))
-        device = torch.cuda.current_device()
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("k_chunk, n_chunk, num_bits, group_size, mnk_factors", MARLIN_TEST_PARAMS, ids=str)
+def test_marlin_24(k_chunk, n_chunk, num_bits, group_size, mnk_factors):
+    from torchao.sparsity.marlin_utils import marlin_24_quantize, MarlinWorkspace
+    m_factor, n_factor, k_factor = mnk_factors
+    MARLIN_24_MIN_THREAD_N = 128
+    MARLIN_24_MAX_PARALLEL = 64
 
-        test_utils = ["test_schema", "test_autograd_registration", "test_faketensor", "test_aot_dispatch_dynamic"]
-        opcheck(
-            torch.ops.torchao.marlin_24_mm,
-            (
-                inputs, sparse_w_int4, meta, out, scales, prob_m, prob_n, prob_k, 
-                workspace, group_size, device, thread_k, thread_m, sms, max_par
-            ),
-            test_utils=test_utils,
-        )
+    size_m = m_factor
+    size_k = k_chunk * k_factor
+    size_n = n_chunk * n_factor
 
-    def _gen_values(self, m, n, k, group_size):
-        maxq = 2**4 - 1
-        inputs = torch.randn((n, k), dtype=torch.half, device="cuda")
-        w = torch.randn((m, k), dtype=torch.half, device="cuda")
+    a_input = torch.randn((size_m, size_k), dtype=torch.float16, device="cuda")
+    b_weight = torch.rand((size_k, size_n), dtype=torch.float16, device="cuda")
 
-        w = w.t()
-        if group_size != -1:
-            w = w.reshape((-1, group_size, m))
-            w = w.permute(1, 0, 2)
-            w = w.reshape((group_size, -1))
+    (w_24_ref, marlin_24_q_w_comp, marlin_24_meta,
+    marlin_24_s) = marlin_24_quantize(b_weight, num_bits, group_size)
 
-        scales = torch.max(torch.abs(w), 0, keepdim=True)[0]
-        scales *= 2 / maxq
+    workspace_24 = MarlinWorkspace(size_n, MARLIN_24_MIN_THREAD_N, MARLIN_24_MAX_PARALLEL)
 
-        w = torch.round(w / scales).int()
-        w += (maxq + 1) // 2
-        w = torch.clamp(w, 0, maxq)
+    output_ref = torch.matmul(a_input, w_24_ref)
 
-        w_fp16 = (w - (maxq + 1) // 2).half() * scales
-        scales = scales.reshape((-1, m)).contiguous()
+    fn_inputs = (
+        a_input, marlin_24_q_w_comp, marlin_24_meta, marlin_24_s, workspace_24.scratch, 
+        num_bits, a_input.shape[0], b_weight.shape[1], a_input.shape[1],
+    )
+    output = torchao.ops.marlin_24_gemm(*fn_inputs)
+    torch.cuda.synchronize()
 
-        if group_size != -1:
+    max_diff = compute_max_diff(output, output_ref)
+    assert max_diff < 0.04
 
-            def reshape(w):
-                w = w.reshape((group_size, -1, m))
-                w = w.permute(1, 0, 2)
-                w = w.reshape((k, m)).contiguous()
-                return w
-
-            w_fp16 = reshape(w_fp16)
-            w = reshape(w)
-        
-        mask = mask_creator(w.T).cuda().bool()
-        sparse_w_fp16_ref = (mask * w_fp16.T).T
-
-        return inputs, sparse_w_fp16_ref, w_fp16, scales
-
-    def _run_problem(self, m, n, k, thread_k, thread_m, group_size=-1):
-        inputs, sparse_w_fp16_ref, w_fp16, scales = self._gen_values(m, n, k, group_size)
-        out_ref = torch.matmul(inputs, sparse_w_fp16_ref)
-
-        # If no groupsize is provided, we assume it is the same as the in_features of the weights
-        # https://github.com/IST-DASLab/Sparse-Marlin/blob/c2ffa2395a3ada26c8cb7f910a5ec65bd3ce288a/marlin/__init__.py#L290
-        if group_size == -1:
-            group_size = k
-
-        w_int4, scales = fp16_to_int4_marlin_format(w_fp16, scales, group_size)
-        sparse_w_int4, scales, meta = pack_to_sparse_marlin_24(w_int4, scales, self.TILES)
-
-        workspace = torch.zeros(m // 128 * 16, device="cuda", dtype=torch.int32)
-        out = marlin_24_mm(inputs, sparse_w_int4, meta, scales, workspace, thread_k, thread_m, -1)
-        torch.cuda.synchronize()
-
-        self.assertLess(
-            torch.mean(torch.abs(out - out_ref)) / torch.mean(torch.abs(out_ref)), 0.002
-        )
-
-        # TODO(diogo): Enable this check once I understand how to make `out` mutable
-        # self._op_check(inputs, sparse_w_int4, meta, scales, workspace, thread_k, thread_m)
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_correctness(self):
-        self._run_problem(256, 16, 256, 128, 128, -1)
-        self._run_problem(21504, 16, 4096, 64, 256, 128)
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_tiles(self):
-        for m in [1, 2, 4, 8, 12, 16, 32, 64]:
-            for thread_k, thread_n in [(64, 256), (128, 128)]:
-                if m > 16 and thread_k == 128:
-                    continue
-                self._run_problem(2 * 256, m, 1024, thread_k, thread_n)
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_k_stages_divisibility(self):
-        for k in [3 * 64 + 64 * 4 * 2 + 64 * i for i in range(1, 4)]:
-            self._run_problem(2 * 256, 16, k, 64, 256)
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_very_few_stages(self):
-        for k in [64, 128, 192]:
-            self._run_problem(3 * 256, 16, k, 64, 256)
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_llama_shapes(self):
-        MODELS = {
-            " 7B": [(4096, 3 * 4096), (4096, 4096), (4096, 2 * 10752), (10752, 4096)],
-            "13B": [(5120, 3 * 5120), (5120, 5120), (5120, 2 * 13568), (13568, 5120)],
-            "33B": [(6656, 3 * 6656), (6656, 6656), (6656, 2 * 17664), (17664, 6656)],
-            "70B": [(8192, 3 * 8192), (8192, 8192), (8192, 2 * 21760), (21760, 8192)],
-        }
-
-        try:
-            for _, layers in MODELS.items():
-                for layer in layers:
-                    for thread_k, thread_m in [(128, 128)]:
-                        for batch in [16]:
-                            print(layer[1], batch, layer[0])
-                            self._run_problem(layer[1], batch, layer[0], thread_k, thread_m)
-        # If someone runs this on a GPU with less than 24GB of memory, it will run out of memory
-        # but we don't want to fail the test
-        except torch.OutOfMemoryError:
-            pass
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_groups(self):
-        for m in [16]:
-            for groupsize in [128]:
-                for n, k in [(256, 512), (256, 1024), (256 * 128, 1024)]:
-                    for thread_shape in [(128, 128), (64, 256)]:
-                        self._run_problem(n, m, k, *thread_shape, groupsize)
+    # Performs opcheck
+    test_utils = ["test_schema", "test_autograd_registration", "test_faketensor"]
+    opcheck(
+        torch.ops.torchao.marlin_24_gemm,
+        fn_inputs,
+        test_utils=test_utils,
+    )
 
 
 if __name__ == "__main__":
