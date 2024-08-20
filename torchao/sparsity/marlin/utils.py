@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 from typing import List
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -9,8 +9,8 @@ class Marlin24Constants:
     TILE: int = 16
     MIN_THREAD_N: int = 128
     MAX_PARALLEL: int = 64
-    SUPPORTED_NUM_BITS: List[int] = [4, 8]
-    SUPPORTED_GROUP_SIZES: List[int] = [-1, 32, 64, 128]
+    SUPPORTED_NUM_BITS: List[int] = field(default_factory=lambda: [4, 8])
+    SUPPORTED_GROUP_SIZES: List[int] = field(default_factory=lambda: [-1, 32, 64, 128])
 const = Marlin24Constants()
 
 

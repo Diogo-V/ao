@@ -321,11 +321,61 @@ MARLIN_TEST_PARAMS = list(itertools.product(
     MARLIN_24_SUPPORTED_GROUP_SIZES, MNK_FACTORS
 ))
 
+def _symmetric_quantize_with_ref(w: torch.Tensor, num_bits: int, group_size: int):
+    orig_device = w.device
+    size_k, size_n = w.shape
+
+    assert w.is_floating_point(), "w must be float"
+
+    if group_size == -1:
+        group_size = size_k
+    assert group_size <= size_k
+
+    max_q_val = 2**num_bits - 1
+    half_q_val = (max_q_val + 1) // 2
+
+    # Reshape to [groupsize, -1]
+    if group_size < size_k:
+        w = w.reshape((-1, group_size, size_n))
+        w = w.permute(1, 0, 2)
+        w = w.reshape((group_size, -1))
+
+    # Compute scale for each group
+    s = torch.max(torch.abs(w), 0, keepdim=True)[0]
+    s *= 2 / max_q_val  # 2 => symmetric
+
+    # Quantize
+    q_w = torch.round(w / s).int()
+    q_w += half_q_val
+    q_w = torch.clamp(q_w, 0, max_q_val)
+
+    # Compute ref (dequantized)
+    w_ref = (q_w - half_q_val).half() * s
+
+    # Restore original shapes
+    if group_size < size_k:
+
+        def reshape_w(w):
+            w = w.reshape((group_size, -1, size_n))
+            w = w.permute(1, 0, 2)
+            w = w.reshape((size_k, size_n)).contiguous()
+            return w
+
+        q_w = reshape_w(q_w)
+        w_ref = reshape_w(w_ref)
+
+    s = s.reshape((-1, size_n)).contiguous()
+
+    return (
+        w_ref.to(device=orig_device),
+        q_w.to(device=orig_device),
+        s.to(device=orig_device),
+    )
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("k_chunk, n_chunk, num_bits, group_size, mnk_factors", MARLIN_TEST_PARAMS, ids=str)
 def test_marlin_24(k_chunk, n_chunk, num_bits, group_size, mnk_factors):
-    from torchao.sparsity.marlin_utils import marlin_24_quantize
-    from torchao.sparsity.marlin import marlin_24_workspace
+    from torchao.sparsity.marlin import marlin_24_workspace, pack_to_marlin_24, inject_24
     m_factor, n_factor, k_factor = mnk_factors
 
     size_m = m_factor
@@ -335,15 +385,21 @@ def test_marlin_24(k_chunk, n_chunk, num_bits, group_size, mnk_factors):
     a_input = torch.randn((size_m, size_k), dtype=torch.float16, device="cuda")
     b_weight = torch.rand((size_k, size_n), dtype=torch.float16, device="cuda")
 
-    (w_24_ref, marlin_24_q_w_comp, marlin_24_meta,
-    marlin_24_s) = marlin_24_quantize(b_weight, num_bits, group_size)
+    # Inject 2:4 sparsity
+    w_24, _ = inject_24(b_weight, size_k, size_n)
 
-    workspace_24 = marlin_24_workspace(size_n)
+    # Symmetric quantize
+    w_24_ref, q_w_24, scale = _symmetric_quantize_with_ref(w_24, num_bits, group_size)
 
+    # Obtains reference output
     output_ref = torch.matmul(a_input, w_24_ref)
 
+    # Packs to marlin 2:4
+    marlin_24_q_w_comp, marlin_24_scale, meta = pack_to_marlin_24(q_w_24, scale, num_bits, group_size)
+    workspace_24 = marlin_24_workspace(size_n)
+
     fn_inputs = (
-        a_input, marlin_24_q_w_comp, marlin_24_meta, marlin_24_s, workspace_24, 
+        a_input, marlin_24_q_w_comp, meta, marlin_24_scale, workspace_24, 
         num_bits, a_input.shape[0], b_weight.shape[1], a_input.shape[1],
     )
     output = torchao.ops.marlin_24_gemm(*fn_inputs)
