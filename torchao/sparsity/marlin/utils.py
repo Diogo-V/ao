@@ -14,6 +14,11 @@ class Marlin24Constants:
 const = Marlin24Constants()
 
 
+def get_pack_factor(num_bits):
+    assert num_bits in const.SUPPORTED_NUM_BITS, f"Unsupported num_bits = {num_bits}"
+    return 32 // num_bits
+
+
 def marlin_permute_weights(q_w, size_k, size_n, perm, tile=const.TILE):
     assert q_w.shape == (size_k, size_n)
     assert size_k % tile == 0, f"size_k = {size_k}, tile = {tile}"
@@ -29,9 +34,18 @@ def marlin_permute_weights(q_w, size_k, size_n, perm, tile=const.TILE):
     return q_w
 
 
-def get_pack_factor(num_bits):
-    assert num_bits in const.SUPPORTED_NUM_BITS, f"Unsupported num_bits = {num_bits}"
-    return 32 // num_bits
+def reverse_marlin_permute_weights(q_w_unpacked, size_k, size_n, reverse_perm, tile=const.TILE):
+    assert (q_w_unpacked.shape[0], size_n) == (size_k // tile, q_w_unpacked.shape[1] // tile)
+    assert size_k % tile == 0, f"size_k = {size_k}, tile = {tile}"
+    assert size_n % tile == 0, f"size_k = {size_n}, tile = {tile}"
+
+    # Reverse permute weights to original shape
+    q_w_comp = q_w_unpacked.reshape((-1, reverse_perm.numel()))[:, reverse_perm].reshape(q_w_unpacked.shape)
+    q_w_comp = q_w_comp.reshape((size_k // tile, size_n // tile, tile, tile))
+    q_w_comp = q_w_comp.permute((0, 2, 1, 3))
+    q_w_comp = q_w_comp.reshape((size_k, size_n))
+
+    return q_w_comp
 
 
 # Precompute permutations for Marlin24 weight and scale shuffling # noqa: E501

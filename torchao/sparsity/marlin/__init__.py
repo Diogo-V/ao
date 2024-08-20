@@ -61,6 +61,11 @@ def pack_to_marlin_24(
         q_w_24_comp, in_features_comp, out_features, num_bits
     )
 
+    reverse = _from_marlin_weights(
+        marlin_24_q_w_comp, in_features_comp, out_features, num_bits
+    )
+    assert torch.equal(reverse, q_w_24_comp)
+
     marlin_24_s = _to_marlin_scales(
         scales, in_features, out_features, group_size, num_bits
     )
@@ -163,7 +168,6 @@ def _to_marlin_weights(q_w, size_k, size_n, num_bits):
 
 
 def _from_marlin_weights(q_packed, size_k, size_n, num_bits, tile=const.TILE):
-    perm = marlin_24_perm[num_bits]
     reverse_perm = reverse_marlin_24_perm[num_bits]
 
     pack_factor = utils.get_pack_factor(num_bits)
@@ -177,11 +181,9 @@ def _from_marlin_weights(q_packed, size_k, size_n, num_bits, tile=const.TILE):
 
     q_w_unpacked = torch.from_numpy(q_w_unpacked.astype(np.int32)).to(orig_device)
 
-    # Reverse Permute
-    q_w_comp = q_w_unpacked.reshape((-1, perm.numel()))[:, reverse_perm].reshape(q_w_unpacked.shape)
-    q_w_comp = q_w_comp.reshape((size_k // tile, size_n // tile, tile, tile))
-    q_w_comp = q_w_comp.permute((0, 2, 1, 3))
-    q_w_comp = q_w_comp.reshape((size_k, size_n))
+    q_w_comp = utils.reverse_marlin_permute_weights(
+        q_w_unpacked, size_k, size_n, reverse_perm
+    )
 
     return q_w_comp
 
