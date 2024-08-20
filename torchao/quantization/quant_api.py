@@ -412,9 +412,6 @@ def int4_weight_only(group_size=128, layout_type = TensorCoreTiledLayoutType(inn
 
         return to_affine_quantized(weight, mapping_type, block_size, target_dtype, quant_min, quant_max, eps, zero_point_dtype=zero_point_dtype, preserve_zero=preserve_zero, zero_point_domain=zero_point_domain, layout_type=layout_type)
 
-    if isinstance(layout_type, MarlinSparseLayoutType) and group_size != 128:
-        raise ValueError("int4_weight_only currently only supports MarlinSparseLayoutType with group_size=128")
-
     return _get_linear_subclass_inserter(apply_int4_weight_only_quant)
 
 
