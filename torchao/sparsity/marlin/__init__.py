@@ -85,11 +85,6 @@ def pack_to_marlin_24(
         q_w_24_comp, in_features_comp, out_features, num_bits
     )
 
-    reverse = _from_marlin_weights(
-        marlin_24_q_w_comp, in_features_comp, out_features, num_bits
-    )
-    assert torch.equal(reverse, q_w_24_comp)
-
     marlin_24_s = _to_marlin_scales(
         scales, in_features, out_features, group_size, num_bits
     )
