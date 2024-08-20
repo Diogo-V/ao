@@ -56,18 +56,18 @@ class SparseMarlin24(TestCase):
         num_bits = 4
         group_size = 128
         shape = (512, 4096)
-        w_int4 = torch.randint(0, 15, shape).int().cuda()
+        w_q = torch.randint(0, 15, shape).int().cuda()
         scales = torch.rand(4096).cuda()
 
-        w_q_24, _ = inject_24(w_int4, *w_int4.shape)
+        w_q_24, _ = inject_24(w_q, *w_q.shape)
 
         # Test pack/unpack equivalence
-        sparse_w_int4, packed_scales, meta = pack_to_marlin_24(w_q_24, scales, num_bits, group_size)
-        unpacked_w_int4, unpacked_scales = unpack_from_marlin_24(
-            sparse_w_int4, packed_scales, meta, tiles, shape, group_size, num_bits
+        q_w_comp, packed_scales, meta = pack_to_marlin_24(w_q_24, scales, num_bits, group_size)
+        unpacked_q_w, unpacked_scales = unpack_from_marlin_24(
+            q_w_comp, packed_scales, meta, tiles, shape, group_size, num_bits
         )
 
-        assert torch.equal(w_int4, unpacked_w_int4), "Unpacked weights do not match original weights"
+        assert torch.equal(w_q, unpacked_q_w), "Unpacked weights do not match original weights"
         assert torch.equal(scales, unpacked_scales), "Unpacked scales do not match original scales"
 
 

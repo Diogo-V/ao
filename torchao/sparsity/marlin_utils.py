@@ -33,7 +33,6 @@ def pack_to_marlin_24(
     )
 
     in_features_comp = in_features // 2
-    # assert decompress_quantized_24_weight(q_w_24_comp, meta, in_features_comp, out_features, num_bits) == q_w_24
 
     # Reformat to marlin
     marlin_24_q_w_comp = to_marlin_weights(
@@ -59,6 +58,7 @@ def unpack_from_marlin_24(
         group_size: int,
         num_bits: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+    in_features, out_features = original_shape
 
     # Unpacks the scales 
     unpacked_scales = from_marlin_scale(
@@ -67,10 +67,41 @@ def unpack_from_marlin_24(
         marlin_24_scale_perm_single[num_bits]
     )
 
+    in_features_comp = in_features // 2
 
-def from_marlin_weights(q_w_24, size_k, size_n, perm) -> torch.Tensor:
-    # TODO(diogo): WIP
-    pass
+    # Unpacks the weights
+    unpacked_q_w_24_comp = from_marlin_weights(
+        q_w_24_comp, in_features_comp, out_features, num_bits, marlin_24_perm[num_bits]
+    )
+
+    # Decompress quantized weight
+    unpacked_q_w_24 = decompress_quantized_24_weight(
+        unpacked_q_w_24_comp, meta, in_features_comp, out_features, num_bits
+    )
+
+    return unpacked_q_w_24, unpacked_scales
+
+
+def from_marlin_weights(q_packed, size_k, size_n, num_bits, perm, tile=MARLIN_TILE):
+    reverse_perm = torch.tensor(perm).argsort()
+    pack_factor = get_pack_factor(num_bits)
+    orig_device = q_packed.device
+
+    # Unpack
+    q_packed = q_packed.cpu().numpy().astype(numpy.uint32)
+    q_w_unpacked = numpy.zeros((q_packed.shape[0], q_packed.shape[1] * pack_factor), dtype=numpy.uint32)
+    for i in range(pack_factor):
+        q_w_unpacked[:, i::pack_factor] = (q_packed >> (num_bits * i)) & ((1 << num_bits) - 1)
+
+    q_w_unpacked = torch.from_numpy(q_w_unpacked.astype(numpy.int32)).to(orig_device)
+
+    # Reverse Permute
+    q_w_comp = q_w_unpacked.reshape((-1, perm.numel()))[:, reverse_perm].reshape(q_w_unpacked.shape)
+    q_w_comp = q_w_comp.reshape((size_k // tile, size_n // tile, tile, tile))
+    q_w_comp = q_w_comp.permute((0, 2, 1, 3))
+    q_w_comp = q_w_comp.reshape((size_k, size_n))
+
+    return q_w_comp
 
 
 def from_marlin_scale(s, size_k, size_n, group_size, scale_perm, scale_perm_single) -> torch.Tensor:
@@ -84,29 +115,6 @@ def from_marlin_scale(s, size_k, size_n, group_size, scale_perm, scale_perm_sing
         s = s.reshape((-1, len(scale_perm_single)))[:, scale_perm_single]
 
     return s.reshape(-1).contiguous()
-
-
-# TODO(diogo): WIP
-def decompress_quantized_24_weight(q_24_comp, meta, size_k, size_n, num_bits) -> torch.Tensor:
-    assert q_24_comp.shape == (size_k, size_n)
-
-    # Resize meta back to its original shape
-    meta = meta.resize_(meta.shape[0] * 2, meta.shape[1] // 2)
-
-    # Remove zp to normalize over 0
-    max_q_val = (1 << num_bits) - 1
-    zp = (max_q_val + 1) // 2
-    q_24_no_zp_comp = q_24_comp - zp
-
-    # Decompress
-    q_24_no_zp_comp = q_24_no_zp_comp.t().contiguous()
-    q_24_no_zp = sparse_semi_structured_to_dense_cutlass(q_24_no_zp_comp, meta)
-    q_24_no_zp = q_24_no_zp.t().contiguous()
-
-    # Restore zp
-    q_24 = q_24_no_zp + zp
-
-    return q_24
 
 
 def marlin_permute_weights(q_w, size_k, size_n, perm, tile=MARLIN_TILE):
@@ -178,6 +186,29 @@ def compress_quantized_24_weight(q_24, size_k, size_n, num_bits):
     meta = meta.resize_(meta.shape[1] // 2, meta.shape[0] * 2)
 
     return q_24_comp, meta
+
+
+# TODO(diogo): WIP
+def decompress_quantized_24_weight(q_24_comp, meta, size_k, size_n, num_bits) -> torch.Tensor:
+    assert q_24_comp.shape == (size_k, size_n)
+
+    # Resize meta back to its original shape
+    meta = meta.resize_(meta.shape[1] // 2, meta.shape[0] * 2)
+
+    # Remove zp to normalize over 0
+    max_q_val = (1 << num_bits) - 1
+    zp = (max_q_val + 1) // 2
+    q_24_no_zp_comp = q_24_comp - zp
+
+    # Decompress
+    q_24_no_zp_comp = q_24_no_zp_comp.t().contiguous()
+    q_24_no_zp = sparse_semi_structured_to_dense_cutlass(q_24_no_zp_comp, meta)
+    q_24_no_zp = q_24_no_zp.t().contiguous()
+
+    # Restore zp
+    q_24 = q_24_no_zp + zp
+
+    return q_24
 
 
 def marlin_24_quantize(
