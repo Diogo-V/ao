@@ -180,10 +180,10 @@ def marlin_24_gemm(
         meta: metadata information for 2:4 sparsity.
         s: scales of shape `(n / groupsize / 2, m)`.
         workspace: tensor with at least `m / 128 * max_par` entries that are all zero.
-        thread_k:  size of a thread_tile in `A` (can usually be left as auto -1).
-        thread_m: size of a thread_tile in `A` (can usually be left as auto -1).
-        sms: number of SMs to use for the kernel (can usually be left as auto -1).
-        max_par: maximum number of batch 64 problems to solve in parallel for large input sizes.
+        bits: number of bits for quantization.
+        size_m: number of rows in input matrix.
+        size_n: number of columns in weight matrix.
+        size_k: number of columns in input matrix.
     Returns:
         output matrix of shape `(n, m)` in column-major layout.
     """
