@@ -15,7 +15,19 @@ __all__ = [
 ]
 
 
-def inject_24(w, size_k, size_n):
+def inject_24(w: torch.Tensor, size_k: int, size_n: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Injects 2:4 sparsity into a weight tensor. The sparsity is applied in a 2:4 ratio, where for every
+    group of 4 weights, 2 will be pruned based on their value. The mask will be created based on the
+    ranked weight values.
+    
+    Args:
+        w (torch.Tensor): The weight tensor to inject sparsity into.
+        size_k (int): The number of input features.
+        size_n (int): The number of output features.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: The pruned weight tensor and the mask tensor.
+    """
     assert w.shape == (size_k, size_n)
     mask = mask_creator(w.t()).t().cuda().bool()
     return (mask * w).contiguous(), mask.contiguous()
@@ -48,6 +60,17 @@ def pack_to_marlin_24(
         num_bits: int, 
         group_size: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Packs the quantized weights and scales into the marlin 2:4 format.
+    
+    Args:
+        q_w_24 (torch.Tensor): The quantized weight tensor with 2:4 sparsity applied.
+        scales (torch.Tensor): The scale tensor.
+        num_bits (int): The number of bits used for quantization.
+        group_size (int): The group size that was applied during quantization.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: The packed quantized weights, the packed scales, and the meta tensor.
+    """
     in_features, out_features = q_w_24.shape
 
     # Compress quantized weight
@@ -82,6 +105,19 @@ def unpack_from_marlin_24(
         group_size: int,
         num_bits: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Unpacks the quantized weights and scales from the marlin 2:4 format.
+
+    Args:
+        q_w_24_comp (torch.Tensor): The packed quantized weights.
+        scales (torch.Tensor): The packed scales.
+        meta (torch.Tensor): The meta tensor.
+        original_shape (torch.Size): The original shape of the weight tensor.
+        group_size (int): The group size that was applied during quantization.
+        num_bits (int): The number of bits used for quantization.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: The unpacked quantized weights and scales.
+    """
     in_features, out_features = original_shape
 
     # Unpacks the scales 
@@ -104,7 +140,24 @@ def unpack_from_marlin_24(
     return unpacked_q_w_24, unpacked_scales
 
 
-def _compress_quantized_24_weight(q_24, size_k, size_n, num_bits):
+def _compress_quantized_24_weight(
+        q_24: torch.Tensor, 
+        size_k: int, 
+        size_n: int, 
+        num_bits: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compresses the quantized weights to a 2:4 sparse format. Normalizes the weights over 0 
+    before compressing them.
+    
+    Args:
+        q_24 (torch.Tensor): The quantized weight tensor.
+        size_k (int): The number of input features.
+        size_n (int): The number of output features.
+        num_bits (int): The number of bits used for quantization.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: The compressed quantized weight tensor and the meta tensor.
+    """
     assert q_24.shape == (size_k, size_n)
 
     # Remove zp to normalize over 0
@@ -127,7 +180,25 @@ def _compress_quantized_24_weight(q_24, size_k, size_n, num_bits):
 
 
 # TODO(diogo): WIP
-def _decompress_quantized_24_weight(q_24_comp, meta, size_k, size_n, num_bits) -> torch.Tensor:
+def _decompress_quantized_24_weight(
+        q_24_comp: torch.Tensor, 
+        meta: torch.Tensor, 
+        size_k: int, 
+        size_n: int, 
+        num_bits: int
+    ) -> torch.Tensor:
+    """Decompresses the quantized weights from a 2:4 sparse format and restores the original shape.
+    
+    Args:
+        q_24_comp (torch.Tensor): The compressed quantized weight tensor in 2:4 sparse format.
+        meta (torch.Tensor): The meta tensor.
+        size_k (int): The number of input features.
+        size_n (int): The number of output features.
+        num_bits (int): The number of bits used for quantization.
+
+    Returns:
+        torch.Tensor: The decompressed quantized weight tensor.
+    """
     assert q_24_comp.shape == (size_k, size_n)
 
     # Resize meta back to its original shape
@@ -149,7 +220,23 @@ def _decompress_quantized_24_weight(q_24_comp, meta, size_k, size_n, num_bits) -
     return q_24
 
 
-def _to_marlin_weights(q_w, size_k, size_n, num_bits):
+def _to_marlin_weights(
+        q_w: torch.Tensor, 
+        size_k: int, 
+        size_n: int, 
+        num_bits: int,
+    ) -> torch.Tensor:
+    """Converts a quantized and 2:4 sparse format weight tensor to the marlin 2:4 format.
+    
+    Args:
+        q_w (torch.Tensor): The quantized weight tensor in 2:4 sparse format.
+        size_k (int): The number of input features.
+        size_n (int): The number of output features.
+        num_bits (int): The number of bits used for quantization.
+
+    Returns:
+        torch.Tensor: The weight tensor in the marlin 2:4 format.
+    """
     # Permute
     q_w = utils.marlin_permute_weights(q_w, size_k, size_n, marlin_24_perm[num_bits])
 
@@ -164,11 +251,26 @@ def _to_marlin_weights(q_w, size_k, size_n, num_bits):
         q_packed |= q_w[:, i::pack_factor] << num_bits * i
 
     q_packed = torch.from_numpy(q_packed.astype(np.int32)).to(orig_device)
-
     return q_packed
 
 
-def _from_marlin_weights(q_packed, size_k, size_n, num_bits, tile=const.TILE):
+def _from_marlin_weights(
+        q_packed: torch.Tensor, 
+        size_k: int, 
+        size_n: int, 
+        num_bits: int
+    ) -> torch.Tensor:
+    """Converts a weight tensor in the marlin 2:4 format to a regular quantized 2:4 sparse format.
+    
+    Args:
+        q_packed (torch.Tensor): The weight tensor in the marlin 2:4 format.
+        size_k (int): The number of input features.
+        size_n (int): The number of output features.
+        num_bits (int): The number of bits used for quantization.
+
+    Returns:
+        torch.Tensor: The weight tensor in the quantized 2:4 sparse format.
+    """
     reverse_perm = reverse_marlin_24_perm[num_bits]
 
     pack_factor = utils.get_pack_factor(num_bits)
@@ -182,35 +284,68 @@ def _from_marlin_weights(q_packed, size_k, size_n, num_bits, tile=const.TILE):
 
     q_w_unpacked = torch.from_numpy(q_w_unpacked.astype(np.int32)).to(orig_device)
 
-    q_w_comp = utils.reverse_marlin_permute_weights(
-        q_w_unpacked, size_k, size_n, reverse_perm
-    )
-
+    q_w_comp = utils.reverse_marlin_permute_weights(q_w_unpacked, size_k, size_n, reverse_perm)
     return q_w_comp
 
 
-def _to_marlin_scales(s, size_k, size_n, group_size, num_bits: int):
+def _to_marlin_scales(
+        scales: torch.Tensor, 
+        size_k: int, 
+        size_n: int, 
+        group_size: int, 
+        num_bits: int
+    ) -> torch.Tensor:
+    """Converts a scale tensor to the format necessary for marlin.
+
+    Args:
+        scales (torch.Tensor): The scale tensor.
+        size_k (int): The number of input features.
+        size_n (int): The number of output features.
+        group_size (int): The group size that was applied during quantization.
+        num_bits (int): The number of bits used for quantization.
+    
+    Returns:
+        torch.Tensor: The scale tensor in the marlin format.
+    """
     if group_size < size_k and group_size != -1:
         perms = marlin_24_scale_perm[num_bits]
-        s = s.reshape((-1, len(perms)))[:, perms]
+        scales = scales.reshape((-1, len(perms)))[:, perms]
     else:
         perms = marlin_24_scale_perm_single[num_bits]
-        s = s.reshape((-1, len(perms)))[:, perms]
-    s = s.reshape((-1, size_n)).contiguous()
-    return s
+        scales = scales.reshape((-1, len(perms)))[:, perms]
+    scales = scales.reshape((-1, size_n)).contiguous()
+    return scales
 
 
-def _from_marlin_scale(s, size_k, size_n, group_size, num_bits: int) -> torch.Tensor:
-    s = s.reshape((-1, size_n)).contiguous()
+def _from_marlin_scale(
+        scales: torch.Tensor, 
+        size_k: int, 
+        size_n: int, 
+        group_size: int, 
+        num_bits: int
+    ) -> torch.Tensor:
+    """Converts a scale tensor from the marlin format to their original format.
+    
+    Args:
+        scales (torch.Tensor): The scale tensor in the marlin format.
+        size_k (int): The number of input features.
+        size_n (int): The number of output features.
+        group_size (int): The group size that was applied during quantization.
+        num_bits (int): The number of bits used for quantization.
+
+    Returns:
+        torch.Tensor: The scale tensor in their original format
+    """
+    scales = scales.reshape((-1, size_n)).contiguous()
 
     if group_size < size_k and group_size != -1:
         reverse_perms = reverse_marlin_24_scale_perm[num_bits]
-        s = s.reshape((-1, len(reverse_perms)))[:, reverse_perms]
+        scales = scales.reshape((-1, len(reverse_perms)))[:, reverse_perms]
     else:
         reverse_perms = reverse_marlin_24_scale_perm_single[num_bits]
-        s = s.reshape((-1, len(reverse_perms)))[:, reverse_perms]
+        scales = scales.reshape((-1, len(reverse_perms)))[:, reverse_perms]
 
-    return s.reshape(-1).contiguous()
+    return scales.reshape(-1).contiguous()
 
 
 # Contains the permutations for marlin 2:4 quantization
