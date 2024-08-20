@@ -584,16 +584,16 @@ class MarlinSparseAQTLayout(AQTLayout):
         )
 
     def get_plain(self):
-        # from torchao.sparsity.marlin import unpack_from_sparse_marlin_24  # avoid circular import
-        # int_data_expanded, scales_expanded = unpack_from_sparse_marlin_24(
-        #     self.int_data, 
-        #     self.scale, 
-        #     self.meta, 
-        #     self.layout_type.tile, 
-        #     self.original_shape
-        # )
-        int_data_expanded = torch.randint(0, 15, self.original_shape, dtype=torch.int32)
-        scales_expanded = torch.rand(self.original_shape[1], dtype=torch.float32)
+        from torchao.sparsity.marlin_utils import unpack_from_marlin_24  # avoid circular import
+        int_data_expanded, scales_expanded = unpack_from_marlin_24(
+            self.int_data, 
+            self.scale, 
+            self.meta, 
+            self.layout_type.tile, 
+            self.original_shape,
+            128,  # TODO(diogo): Put this in the dataclass
+            4
+        )
         return int_data_expanded, scales_expanded, self.zero_point
 
     @classmethod
@@ -1011,6 +1011,7 @@ def _linear_fp_act_int4_weight_sparse_marlin_check(input_tensor, weight_tensor, 
 def _linear_fp_act_int4_weight_sparse_marlin_impl(input_tensor, weight_tensor, bias):
     from torchao.sparsity.marlin_utils import MarlinWorkspace
 
+    # TODO: Put this in the dataclass
     num_bits = 4
     sparse_w_int4 = weight_tensor.layout_tensor.int_data
     scale = weight_tensor.layout_tensor.scale
