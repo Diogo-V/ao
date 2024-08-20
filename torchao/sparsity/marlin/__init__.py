@@ -4,6 +4,7 @@ from typing import Tuple, Dict, List
 
 import torchao.sparsity.marlin.utils as utils
 from torchao.sparsity.marlin.utils import const
+from torchao.sparsity.utils import mask_creator
 
 
 __all__ = [
@@ -16,7 +17,7 @@ __all__ = [
 
 def inject_24(w, size_k, size_n):
     assert w.shape == (size_k, size_n)
-    mask = utils.mask_creator(w.t()).t().cuda().bool()
+    mask = mask_creator(w.t()).t().cuda().bool()
     return (mask * w).contiguous(), mask.contiguous()
 
 

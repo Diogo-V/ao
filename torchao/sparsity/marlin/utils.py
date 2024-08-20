@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from typing import List
+from typing import List, Tuple
 from dataclasses import dataclass, field
 
 
@@ -14,12 +14,40 @@ class Marlin24Constants:
 const = Marlin24Constants()
 
 
-def get_pack_factor(num_bits):
+def get_pack_factor(num_bits: int) -> int:
+    """Compute the packing factor for a given number of bits.
+    
+    Args:
+        num_bits (int): Number of bits to pack.
+
+    Returns:
+        int: The packing factor.
+    """
+
     assert num_bits in const.SUPPORTED_NUM_BITS, f"Unsupported num_bits = {num_bits}"
     return 32 // num_bits
 
 
-def marlin_permute_weights(q_w, size_k, size_n, perm, tile=const.TILE):
+def marlin_permute_weights(
+        q_w: torch.Tensor, 
+        size_k: int, 
+        size_n: int, 
+        perm: torch.Tensor, 
+        tile: int = const.TILE
+    ) -> torch.Tensor:
+    """Permute weights to 16x64 Marlin tiles.
+    
+    Args:
+        q_w (torch.Tensor): Quantized weights.
+        size_k (int): Number of input features.
+        size_n (int): Number of output features.
+        perm (torch.Tensor): The computed permutation tensor to be applied.
+        tile (int, optional): Tile size. Defaults to `TILE`.
+
+    Returns:
+        torch.Tensor: Weight tensor permuted to Marlin tiles.
+    """
+
     assert q_w.shape == (size_k, size_n)
     assert size_k % tile == 0, f"size_k = {size_k}, tile = {tile}"
     assert size_n % tile == 0, f"size_k = {size_n}, tile = {tile}"
@@ -34,7 +62,26 @@ def marlin_permute_weights(q_w, size_k, size_n, perm, tile=const.TILE):
     return q_w
 
 
-def reverse_marlin_permute_weights(q_w_unpacked, size_k, size_n, reverse_perm, tile=const.TILE):
+def reverse_marlin_permute_weights(
+        q_w_unpacked: torch.Tensor, 
+        size_k: int, 
+        size_n: int, 
+        reverse_perm: torch.Tensor, 
+        tile: int = const.TILE,
+    ) -> torch.Tensor:
+    """Reverse permute weights from 16x64 Marlin tiles.
+
+    Args:
+        q_w_unpacked (torch.Tensor): Unpacked quantized weights.
+        size_k (int): Number of input features.
+        size_n (int): Number of output features.
+        reverse_perm (torch.Tensor): The computed reverse permutation tensor to be applied.
+        tile (int, optional): Tile size. Defaults to `TILE`.
+
+    Returns:
+        torch.Tensor: Weight tensor reverse permuted from Marlin tiles.
+    """
+
     assert (q_w_unpacked.shape[0], size_n) == (size_k // tile, q_w_unpacked.shape[1] // tile)
     assert size_k % tile == 0, f"size_k = {size_k}, tile = {tile}"
     assert size_n % tile == 0, f"size_k = {size_n}, tile = {tile}"
@@ -48,15 +95,24 @@ def reverse_marlin_permute_weights(q_w_unpacked, size_k, size_n, reverse_perm, t
     return q_w_comp
 
 
-# Precompute permutations for Marlin24 weight and scale shuffling # noqa: E501
-#
-# Marlin works on [16*2,64] tiles. The goal of the permutations is to reorder the weight data so that it is compatible noqa: # noqa: E501
-# with the tensor-core format that is described here:
-# https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#matrix-fragments-for-mma-m16n8k16-with-floating-point-type # noqa: E501
-#
-# As a result of this reordering, the vector loads inside the kernel will get the data as it is needed for tensor-core # noqa: E501
-# (without the need to use ldmatrix instructions) # noqa: E501
-def get_perms_24(num_bits: int):
+
+def get_perms_24(num_bits: int) -> Tuple[torch.Tensor, List[int], List[int]]:
+    """Precompute permutations for Marlin24 weight and scale shuffling
+    
+    Marlin works on [16*2,64] tiles. The goal of the permutations is to reorder the weight data so that it is compatible
+    with the tensor-core format that is described here:
+    https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#matrix-fragments-for-mma-m16n8k16-with-floating-point-type
+    
+    As a result of this reordering, the vector loads inside the kernel will get the data as it is needed for tensor-core
+    (without the need to use ldmatrix instructions)
+    
+    Args:
+        num_bits (int): Number of bits to pack.
+
+    Returns:
+        Tuple[torch.Tensor, List[int], List[int]]: The weight permutation tensor, scale permutation list and 
+        scale permutation list for single group.
+    """
     perm_list: List[int] = []
     for i in range(32):
         perm1: List[int] = []
@@ -362,35 +418,3 @@ def sparse_semi_structured_to_dense_cutlass(sparse, meta_reordered):
                                         sparse.view(torch.half).view(-1))
 
     return dense.view(m, 2 * k)
-
-
-def mask_creator(tensor):
-    """
-    Class for creating N:M sparsity masks.
-    Masks will be created using the N:M ratio, where for every block of 
-    M weights, N will be pruned based on ranked weight value. Each mask 
-    will correspond to the given tensor.
-
-    :param N: The number of weights in a group to keep
-    :param M: The size of a weight group
-    """
-    N = 2
-    M = 4
-
-    mask = None
-    # for i, tensor in enumerate(tensors):
-    if tensor.numel() % M != 0:
-        raise ValueError(
-            f"Tensor of size {tensor.shape} can't be evenly divided into "
-            f"{M} groups")
-
-    num_groups = tensor.numel() // M
-
-    # N:M sparsity for linear layers
-    tensor_temp = tensor.detach().abs().reshape(num_groups, M)
-    index = torch.argsort(tensor_temp, dim=1)[:, :int(M - N)]
-
-    w_b = torch.ones(tensor_temp.shape, device=tensor_temp.device)
-    mask = w_b.scatter_(dim=1, index=index, value=0).reshape(tensor.shape)
-
-    return mask
