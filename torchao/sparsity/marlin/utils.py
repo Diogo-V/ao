@@ -1,4 +1,82 @@
 import torch
+import numpy as np
+from typing import List
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Marlin24Constants:
+    TILE: int = 16
+    MIN_THREAD_N: int = 128
+    MAX_PARALLEL: int = 64
+    SUPPORTED_NUM_BITS: List[int] = [4, 8]
+    SUPPORTED_GROUP_SIZES: List[int] = [-1, 32, 64, 128]
+const = Marlin24Constants()
+
+
+def marlin_permute_weights(q_w, size_k, size_n, perm, tile=const.TILE):
+    assert q_w.shape == (size_k, size_n)
+    assert size_k % tile == 0, f"size_k = {size_k}, tile = {tile}"
+    assert size_n % tile == 0, f"size_k = {size_n}, tile = {tile}"
+
+    # Permute weights to 16x64 marlin tiles
+    q_w = q_w.reshape((size_k // tile, tile, size_n // tile, tile))
+    q_w = q_w.permute((0, 2, 1, 3))
+    q_w = q_w.reshape((size_k // tile, size_n * tile))
+
+    q_w = q_w.reshape((-1, perm.numel()))[:, perm].reshape(q_w.shape)
+
+    return q_w
+
+
+def get_pack_factor(num_bits):
+    assert num_bits in const.SUPPORTED_NUM_BITS, f"Unsupported num_bits = {num_bits}"
+    return 32 // num_bits
+
+
+# Precompute permutations for Marlin24 weight and scale shuffling # noqa: E501
+#
+# Marlin works on [16*2,64] tiles. The goal of the permutations is to reorder the weight data so that it is compatible noqa: # noqa: E501
+# with the tensor-core format that is described here:
+# https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#matrix-fragments-for-mma-m16n8k16-with-floating-point-type # noqa: E501
+#
+# As a result of this reordering, the vector loads inside the kernel will get the data as it is needed for tensor-core # noqa: E501
+# (without the need to use ldmatrix instructions) # noqa: E501
+def get_perms_24(num_bits: int):
+    perm_list: List[int] = []
+    for i in range(32):
+        perm1: List[int] = []
+        col = i // 4
+        col_o = col // 2
+        for block in [0, 1]:
+            for row in [
+                    2 * (i % 4),
+                    2 * (i % 4) + 1,
+                    2 * (i % 4 + 4),
+                    2 * (i % 4 + 4) + 1,
+            ]:
+                perm1.append(16 * row + col_o * 256 + 8 * (col % 2) +
+                             4 * block)
+        for j in range(4):
+            perm_list.extend([p + 1 * j for p in perm1])
+    perm = np.array(perm_list)
+
+    if num_bits == 4:
+        interleave = np.array([0, 2, 4, 6, 1, 3, 5, 7])
+    elif num_bits == 8:
+        interleave = np.array([0, 2, 1, 3])
+    else:
+        raise ValueError("num_bits must be 4 or 8, got {}".format(num_bits))
+
+    perm = perm.reshape((-1, len(interleave)))[:, interleave].ravel()
+    perm = torch.from_numpy(perm)
+    scale_perm: List[int] = []
+    for i in range(8):
+        scale_perm.extend([i * 8 + j for j in [0, 4, 1, 5, 2, 6, 3, 7]])
+    scale_perm_single: List[int] = []
+    for i in range(8):
+        scale_perm_single.extend([8 * i + j for j in [0, 1, 2, 3, 4, 5, 6, 7]])
+    return perm, scale_perm, scale_perm_single
 
 
 # This is PyTorch implementation of main part of reorder_meta()

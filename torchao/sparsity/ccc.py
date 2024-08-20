@@ -1,13 +1,5 @@
 import torch
 
-SUPPORTED_NUM_BITS = [4, 8]
-SUPPORTED_GROUP_SIZES = [-1, 32, 64, 128]
-
-
-def get_pack_factor(num_bits):
-    assert num_bits in SUPPORTED_NUM_BITS, f"Unsupported num_bits = {num_bits}"
-    return 32 // num_bits
-
 
 def permute_rows(q_w: torch.Tensor, w_ref: torch.Tensor, group_size: int):
     assert q_w.shape == w_ref.shape
@@ -40,10 +32,6 @@ def quantize_weights(w: torch.Tensor, num_bits: int, group_size: int,
     size_k, size_n = w.shape
 
     assert w.is_floating_point(), "w must be float"
-    assert num_bits in SUPPORTED_NUM_BITS, f"Unsupported num_bits = {num_bits}"
-    assert group_size in SUPPORTED_GROUP_SIZES + [
-        size_k
-    ], f"Unsupported groupsize = {group_size}"
 
     if group_size == -1:
         group_size = size_k

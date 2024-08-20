@@ -7,7 +7,7 @@ from torch.testing._internal.common_utils import TestCase, run_tests
 from torchao.dtypes import MarlinSparseLayoutType
 from torchao.sparsity.sparse_api import apply_fake_sparsity
 from torchao.quantization.quant_api import int4_weight_only, quantize_
-from torchao.sparsity.marlin_utils import (
+from torchao.sparsity.marlin import (
     pack_to_marlin_24,
     unpack_from_marlin_24,
     inject_24
@@ -52,7 +52,6 @@ class SparseMarlin24(TestCase):
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="Need CUDA available")
     def test_pack_unpack_equivalence(self):
-        tiles = 16
         num_bits = 4
         group_size = 128
         shape = (512, 4096)
@@ -64,7 +63,7 @@ class SparseMarlin24(TestCase):
         # Test pack/unpack equivalence
         q_w_comp, packed_scales, meta = pack_to_marlin_24(w_q_24, scales, num_bits, group_size)
         unpacked_q_w, unpacked_scales = unpack_from_marlin_24(
-            q_w_comp, packed_scales, meta, tiles, shape, group_size, num_bits
+            q_w_comp, packed_scales, meta, shape, group_size, num_bits
         )
 
         assert torch.equal(w_q, unpacked_q_w), "Unpacked weights do not match original weights"

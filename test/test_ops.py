@@ -324,10 +324,9 @@ MARLIN_TEST_PARAMS = list(itertools.product(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("k_chunk, n_chunk, num_bits, group_size, mnk_factors", MARLIN_TEST_PARAMS, ids=str)
 def test_marlin_24(k_chunk, n_chunk, num_bits, group_size, mnk_factors):
-    from torchao.sparsity.marlin_utils import marlin_24_quantize, MarlinWorkspace
+    from torchao.sparsity.marlin_utils import marlin_24_quantize
+    from torchao.sparsity.marlin import marlin_24_workspace
     m_factor, n_factor, k_factor = mnk_factors
-    MARLIN_24_MIN_THREAD_N = 128
-    MARLIN_24_MAX_PARALLEL = 64
 
     size_m = m_factor
     size_k = k_chunk * k_factor
@@ -339,12 +338,12 @@ def test_marlin_24(k_chunk, n_chunk, num_bits, group_size, mnk_factors):
     (w_24_ref, marlin_24_q_w_comp, marlin_24_meta,
     marlin_24_s) = marlin_24_quantize(b_weight, num_bits, group_size)
 
-    workspace_24 = MarlinWorkspace(size_n, MARLIN_24_MIN_THREAD_N, MARLIN_24_MAX_PARALLEL)
+    workspace_24 = marlin_24_workspace(size_n)
 
     output_ref = torch.matmul(a_input, w_24_ref)
 
     fn_inputs = (
-        a_input, marlin_24_q_w_comp, marlin_24_meta, marlin_24_s, workspace_24.scratch, 
+        a_input, marlin_24_q_w_comp, marlin_24_meta, marlin_24_s, workspace_24, 
         num_bits, a_input.shape[0], b_weight.shape[1], a_input.shape[1],
     )
     output = torchao.ops.marlin_24_gemm(*fn_inputs)
