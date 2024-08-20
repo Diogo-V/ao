@@ -12,6 +12,7 @@ from torch.testing._internal.common_utils import (
 from torch.testing._internal.optests import opcheck
 from torchao.utils import is_fbcode, TORCH_VERSION_AT_LEAST_2_5, compute_max_diff
 from torchao.prototype.quant_llm import from_scaled_tc_fpx
+from torchao.sparsity.marlin import marlin_24_workspace, pack_to_marlin_24, inject_24
 import pytest
 
 if is_fbcode():
@@ -375,7 +376,6 @@ def _symmetric_quantize_with_ref(w: torch.Tensor, num_bits: int, group_size: int
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("k_chunk, n_chunk, num_bits, group_size, mnk_factors", MARLIN_TEST_PARAMS, ids=str)
 def test_marlin_24(k_chunk, n_chunk, num_bits, group_size, mnk_factors):
-    from torchao.sparsity.marlin import marlin_24_workspace, pack_to_marlin_24, inject_24
     m_factor, n_factor, k_factor = mnk_factors
 
     size_m = m_factor
