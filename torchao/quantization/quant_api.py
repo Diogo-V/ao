@@ -399,7 +399,7 @@ def int8_dynamic_activation_int4_weight(group_size=32):
     return insert_subclass
 
 
-def int4_weight_only(group_size=128, layout_type = TensorCoreTiledLayoutType(inner_k_tiles=8)):
+def int4_weight_only(group_size=128, layout_type=TensorCoreTiledLayoutType(inner_k_tiles=8)):
     """
     Applies uint4 weight-only asymmetric per-group quantization to linear layers, using
     "tensor_core_tiled" layout for speedup with tinygemm kernel
