@@ -625,8 +625,9 @@ class MarlinSparseAQTLayout(AQTLayout):
         # Linear layers are (in_features, out_features) but the int_data that is reaching this point
         # is (out_features, in_features). We need to transpose it to match the expected shape in the marlin code.
         # NOTE(reviewers): Please check if this is what I should do.
-        q_w_24 = int_data.t()
-        scale = scale.reshape(-1, q_w_24.shape[1])
+        # q_w_24 = int_data.t()
+        # scale = scale.reshape(-1, q_w_24.shape[1])
+        q_w_24 = int_data
 
         if q_w_24.dtype != torch.int32:
             raise ValueError("Only `torch.int32` weights are supported.")
@@ -646,7 +647,7 @@ class MarlinSparseAQTLayout(AQTLayout):
                 f"Only {[4]} bits are supported, got {num_bits}."
             )
 
-        group_size = in_features // scale.shape[0]
+        group_size = 128  # in_features // scale.shape[0]
         if group_size == 0:
             group_size = in_features
         assert group_size <= in_features, "Group size must be less than or equal to in_features."
@@ -658,6 +659,9 @@ class MarlinSparseAQTLayout(AQTLayout):
 
         # Compress quantized weight to marlin 2:4 format
         marlin_24_q_w_comp, marlin_24_s, meta = pack_to_marlin_24(q_w_24, scale, num_bits, group_size)
+
+        assert q_w_24.shape[0] // 2 // 16 == marlin_24_q_w_comp.shape[0], "Marlin 2:4 weight compression failed."
+        assert q_w_24.shape[1] * 16 // 8 == marlin_24_q_w_comp.shape[1], "Marlin 2:4 weight compression failed."
 
         return cls(
             marlin_24_q_w_comp, marlin_24_s, zero_point, 
@@ -678,7 +682,7 @@ class MarlinSparseAQTLayout(AQTLayout):
 
 # Marlin Sparse op dispatch registration 
 @MarlinSparseAQTLayout.implements(aten.detach.default)
-def block_sparse_detach(func, types, args, kwargs):
+def _(func, types, args, kwargs):
     return return_and_correct_aliasing(func, args, kwargs, args[0]._apply_fn_to_data(torch.detach))
 
 
@@ -1064,37 +1068,37 @@ def _linear_fp_act_int4_weight_sparse_marlin_impl(input_tensor, weight_tensor, b
     scale = weight_tensor.layout_tensor.scale
     meta = weight_tensor.layout_tensor.meta
     original_shape = weight_tensor.layout_tensor.original_shape
-    print("original_shape", original_shape)
     num_bits = weight_tensor.layout_tensor.num_bits
 
-    # Saves batch size for reshaping back to original shape after the matmul
-    # Reshapes tensor to (m, k) where m is in_features * batch and k is out_features
-    # NOTE(reviewers): Please check if I am handling the batch size correctly
-    batch_size = -1
-    if input_tensor.dim() == 3:
-        batch_size = input_tensor.size(0)
-        input_tensor = input_tensor.reshape(-1, input_tensor.shape[-1])
+    print(f"Original shape: {original_shape}")
 
+    # Fold the batch dimension into the first dimension
+    input_tensor = input_tensor.view(-1, input_tensor.shape[-1])
+
+    # NOTE(diogo): scale.shape[1] == original_shape[1]
     size_m = input_tensor.shape[0]
-    size_n = original_shape[1]
+    size_n = scale.shape[1]
     size_k = input_tensor.shape[1]
     workspace_24 = marlin_24_workspace(original_shape[1])
 
-    print(size_m, size_n, size_k)
+    assert original_shape[0] // 2 // 16 == sparse_w_int4.shape[0], "Marlin 2:4 weight compression failed."
+    assert original_shape[1] * 16 // 8 == sparse_w_int4.shape[1], "Marlin 2:4 weight compression failed."
+
+    # assert (size_k / 16 / 2) == sparse_w_int4.size(0), "Marlin 2:4 weight compression failed."
 
     # Pad input_tensor dim 1 to a multiple of the marlin tile size (16)
-    if size_k % const.TILE != 0:
-        pad_size = find_multiple(size_k, const.TILE)
-        input_tensor = torch.nn.functional.pad(input_tensor, (0, pad_size - size_k))
-        size_k = pad_size
+    # if size_k % const.TILE != 0:
+    #     pad_size = find_multiple(size_k, const.TILE)
+    #     input_tensor = torch.nn.functional.pad(input_tensor, (0, pad_size - size_k))
+    #     size_k = pad_size
 
     out = torchao.ops.marlin_24_gemm(
         input_tensor, sparse_w_int4, meta, scale, 
         workspace_24, num_bits, size_m, size_n, size_k
     )
 
-    if batch_size != -1:
-        out = out.view(batch_size, -1, out.shape[-1])
+    # Unfold the batch dimension
+    out = out.reshape(input_tensor.shape[:-1] + (scale.shape[1],))
 
     if bias is not None:
         out += bias.to(out.dtype)

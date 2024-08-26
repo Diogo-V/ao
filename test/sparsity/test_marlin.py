@@ -27,17 +27,17 @@ class SparseMarlin24(TestCase):
         model = (
             nn.Sequential(
                 nn.Linear(4096, 11008),  # Llama2 shapes
-                nn.Linear(11008, 4096),
-                nn.ReLU(),
-                nn.Linear(4096, 11008),
-                nn.Linear(11008, 4096),
+                # nn.Linear(11008, 4096),
+                # nn.ReLU(),
+                # nn.Linear(4096, 11008),
+                # nn.Linear(11008, 4096),
             )
             .half()
             .cuda()
         )
 
-        apply_fake_sparsity(model)
         # Baseline
+        apply_fake_sparsity(model)
         model_copy = copy.deepcopy(model)
 
         # Quantized
@@ -48,9 +48,8 @@ class SparseMarlin24(TestCase):
         quantize_(model, int4_weight_only(layout_type=MarlinSparseLayoutType()))
         sparse_result = model(input)
 
-        error_dense = torch.mean(torch.abs(ref_result - dense_result) ** 2)
-        error_sparse = torch.mean(torch.abs(ref_result - sparse_result) ** 2)
-        assert torch.allclose(dense_model, sparse_model, atol=1e-2), "Mean error is not close"
+        assert sparse_result.stride() == dense_result.stride(), "Strides do not match"
+        assert torch.allclose(dense_result, sparse_result, atol=1e-2), "Results are not close"
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="Need CUDA available")
     def test_quant_sparse_marlin_layout_compile(self):

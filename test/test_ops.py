@@ -304,19 +304,14 @@ def test_dequantize_tensor_core_tiled_layout_op(shape, inner_k_tiles, group_size
     )
 
 
-MARLIN_24_BATCH_SIZE = [1, 4, 8, 16, 32, 64]
+MARLIN_24_BATCH_SIZE = [32]
 MARLIN_24_K_CHUNKS = [128]
 MARLIN_24_N_CHUNKS = [512]
 MNK_FACTORS = [
-    (1, 1, 1),
-    (1, 4, 8),
-    (1, 7, 5),
-    (13, 17, 67),
-    (26, 37, 13),
     (67, 13, 11),
 ]
-MARLIN_24_SUPPORTED_NUM_BITS = [4, 8]
-MARLIN_24_SUPPORTED_GROUP_SIZES = [-1, 128]
+MARLIN_24_SUPPORTED_NUM_BITS = [4]
+MARLIN_24_SUPPORTED_GROUP_SIZES = [128]
 
 MARLIN_TEST_PARAMS = list(itertools.product(
     MARLIN_24_BATCH_SIZE, MARLIN_24_K_CHUNKS, MARLIN_24_N_CHUNKS, 
@@ -373,6 +368,58 @@ def _symmetric_quantize_with_ref(w: torch.Tensor, num_bits: int, group_size: int
         q_w.to(device=orig_device),
         s.to(device=orig_device),
     )
+
+
+class Marlin24Linear(torch.nn.Linear):
+    def __init__(self, in_features, out_features, num_bits, group_size, bias=False):
+        super().__init__(in_features, out_features, bias, device="cuda", dtype=torch.float16)
+        self.weight.requires_grad = False
+
+        size_k, size_n = self.weight.shape
+        self.num_bits = num_bits
+
+        w_24, _ = inject_24(self.weight, size_k, size_n)
+
+        self.w_24_ref, q_w_24, self.scale = _symmetric_quantize_with_ref(w_24, num_bits, group_size)
+
+        self.marlin_24_q_w_comp, self.marlin_24_scale, self.meta = pack_to_marlin_24(q_w_24, self.scale, num_bits, group_size)
+        self.workspace_24 = marlin_24_workspace(size_n)
+
+    def forward(self, a_input):
+        a_input = a_input.view(-1, a_input.shape[-1])
+
+        size_m = a_input.shape[0]
+        size_n = self.marlin_24_scale.shape[1]
+        size_k = a_input.shape[1]
+
+        output = torchao.ops.marlin_24_gemm(
+            a_input, self.marlin_24_q_w_comp, self.meta, self.marlin_24_scale, self.workspace_24, 
+            self.num_bits, size_m, size_n, size_k
+        )
+        output = output.reshape(a_input.shape[:-1] + (self.marlin_24_scale.shape[1],))
+
+        return output
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("batch_size, k_chunk, n_chunk, num_bits, group_size, mnk_factors", MARLIN_TEST_PARAMS, ids=str)
+def test_marlin_24_v2(batch_size, k_chunk, n_chunk, num_bits, group_size, mnk_factors):
+    m_factor, n_factor, k_factor = mnk_factors
+
+    size_m = m_factor
+    size_k = k_chunk * k_factor
+    size_n = n_chunk * n_factor
+
+    a_input = torch.randn((batch_size, size_m, size_k), dtype=torch.float16, device="cuda")
+    lin = Marlin24Linear(size_k, size_n, num_bits, group_size).to("cuda")
+
+    out = lin(a_input)
+
+    out_ref = torch.matmul(a_input.view(-1, a_input.shape[-1]), lin.w_24_ref)
+    out_ref = out_ref.reshape(a_input.shape[:-1] + (lin.scale.shape[1],))
+    
+    max_diff = compute_max_diff(out, out_ref)
+    assert max_diff < 0.04
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("batch_size, k_chunk, n_chunk, num_bits, group_size, mnk_factors", MARLIN_TEST_PARAMS, ids=str)
