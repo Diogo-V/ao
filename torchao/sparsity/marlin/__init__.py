@@ -201,6 +201,9 @@ def _decompress_quantized_24_weight(
     q_24_no_zp = utils.sparse_semi_structured_to_dense_cutlass(q_24_no_zp_comp, meta)
     q_24_no_zp = q_24_no_zp.t().contiguous()
 
+    # Revert meta resize
+    meta = meta.resize_(meta.shape[1] // 2, meta.shape[0] * 2)
+
     # Restore zp
     q_24 = q_24_no_zp + zp
 
