@@ -18,8 +18,8 @@ from torchao.dtypes import MarlinSparseLayoutType
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false" # silence warnings when compiling
 model_name = "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T"
-warmup = 1     # 5
-num_runs = 1   # 25
+warmup = 5
+num_runs = 25
 
 torch.set_float32_matmul_precision('high')
 
